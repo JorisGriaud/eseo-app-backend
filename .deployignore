@@ -1,0 +1,58 @@
+# Fichiers à exclure lors du déploiement distant
+
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+ENV/
+*.egg-info/
+
+# Database & Data
+*.db
+*.sqlite
+*.sqlite3
+data/
+backups/
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+
+# SWAG volumes
+swag/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (optionnel - décommenter si vous ne voulez pas les transférer)
+# README.md
+# DEPLOYMENT.md
+# REMOTE-DEPLOY.md
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*~
+
+# Deployment scripts (optionnel)
+# deploy-remote.sh
+# deploy-remote.ps1

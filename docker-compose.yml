@@ -1,0 +1,33 @@
+services:
+  eseo-app-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eseo-app-backend
+    environment:
+      - TZ=Europe/Paris
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - DATABASE_URL=sqlite:///./data/edt.db
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Mount only data directory (not source code for production)
+      - edt-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    ports:
+      - 9080:8000
+    networks:
+      - edt-network
+    restart: unless-stopped
+
+networks:
+  edt-network:
+    driver: bridge
+
+volumes:
+  edt-data:
+    driver: local
