@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # EDT ESEO Backend
 
 Backend API pour la gestion des emplois du temps ESEO avec authentification sécurisée et synchronisation automatique.
