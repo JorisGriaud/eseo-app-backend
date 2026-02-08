@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # EDT ESEO Backend
 
 Backend API pour la gestion des emplois du temps ESEO avec authentification sécurisée et synchronisation automatique.
@@ -228,3 +229,6 @@ Développé avec ❤️ pour simplifier l'accès aux emplois du temps ESEO.
 - [SWAG Documentation](https://docs.linuxserver.io/general/swag)
 - [Playwright Python](https://playwright.dev/python/)
 - [APScheduler](https://apscheduler.readthedocs.io/)
+=======
+# eseo-backend-app
+>>>>>>> ceae916791c2d3d0a064f9c80d3ec888d29ed58c
