@@ -7,9 +7,13 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timezone, timedelta, date
 import time
 import json
-import requests
 import asyncio
 from typing import List
+import os
+
+# Firebase Admin SDK
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 from database import SessionLocal, User, Event
 from scraper import ESEOScraper
@@ -18,52 +22,93 @@ from utils import PARIS_TZ, calculate_schedule_hash_for_range, parse_eseo_dateti
 # Global scheduler instance
 scheduler = BackgroundScheduler()
 
+# Initialize Firebase Admin SDK (once at startup)
+def initialize_firebase():
+    """
+    Initialize Firebase Admin SDK with service account credentials
+
+    Note: This should be called once at application startup
+    """
+    if not firebase_admin._apps:
+        try:
+            cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "./credentials/firebase-credentials.json")
+
+            if not os.path.exists(cred_path):
+                print(f"Warning: Firebase credentials not found at {cred_path}")
+                print("Push notifications will be disabled")
+                return False
+
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred)
+            print(f"✅ Firebase Admin SDK initialized with credentials from: {cred_path}")
+            return True
+        except Exception as e:
+            print(f"Error initializing Firebase Admin SDK: {e}")
+            return False
+    return True
+
 
 def send_firebase_notification(device_token: str, title: str, body: str, data: dict = None):
     """
-    Send push notification via Firebase Cloud Messaging
+    Send push notification via Firebase Admin SDK
 
     Args:
         device_token: FCM device token
         title: Notification title
         body: Notification body
-        data: Additional data payload
+        data: Additional data payload (optional)
 
-    Note: Requires Firebase Server Key to be set in environment
-          Get it from Firebase Console > Project Settings > Cloud Messaging
+    Returns:
+        Message ID if successful, None otherwise
+
+    Note: Requires Firebase Admin SDK to be initialized with credentials
     """
-    import os
-
-    fcm_server_key = os.getenv("FCM_SERVER_KEY")
-    if not fcm_server_key:
-        print("Warning: FCM_SERVER_KEY not set, skipping notification")
-        return
-
-    fcm_url = "https://fcm.googleapis.com/fcm/send"
-    headers = {
-        "Authorization": f"key={fcm_server_key}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "to": device_token,
-        "notification": {
-            "title": title,
-            "body": body,
-            "sound": "default"
-        },
-        "priority": "high"
-    }
-
-    if data:
-        payload["data"] = data
+    # Ensure Firebase is initialized
+    if not initialize_firebase():
+        print("Firebase not initialized, skipping notification")
+        return None
 
     try:
-        response = requests.post(fcm_url, headers=headers, json=payload, timeout=10)
-        response.raise_for_status()
-        print(f"Notification sent successfully to {device_token[:20]}...")
-    except requests.RequestException as e:
-        print(f"Error sending notification: {e}")
+        # Construct the message
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            token=device_token,
+            # Android-specific options
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    sound='default',
+                    click_action='FLUTTER_NOTIFICATION_CLICK',
+                ),
+            ),
+            # iOS-specific options
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        sound='default',
+                    ),
+                ),
+            ),
+        )
+
+        # Add custom data if provided
+        if data:
+            message.data = data
+
+        # Send the message
+        response = messaging.send(message)
+        print(f"✅ Notification sent successfully to {device_token[:20]}... (Message ID: {response})")
+        return response
+
+    except firebase_admin.exceptions.FirebaseError as e:
+        print(f"❌ Firebase error sending notification: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Error sending notification: {e}")
+        return None
 
 
 def sync_user_schedule(eseo_id: int, device_token: str = None, current_hash: str = None, sync_range: int = 4) -> bool:

@@ -456,6 +456,11 @@ async def startup_event():
     print("Starting EDT ESEO Backend...")
     init_db()
     print("Database initialized")
+
+    # Initialize Firebase Admin SDK for push notifications
+    from scheduler import initialize_firebase
+    initialize_firebase()
+
     start_scheduler()
     print("Background scheduler started")
 

@@ -107,3 +107,9 @@ coverage.xml
 # Secrets
 secrets/
 *.secret
+
+# Firebase credentials
+credentials/
+*firebase*.json
+serviceAccountKey.json
+FIREBASE-SETUP.md
