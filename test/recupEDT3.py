@@ -34,7 +34,7 @@ def fetch_agenda(user_id):
     except json.JSONDecodeError as e:
         return f"Erreur de lecture JSON (Vérifie l'ID ou l'accès au lien) : {e}"
 
-# mon_id = 54024 # Ton ID trouvé dans la console
+# mon_id = 00000 # Ton ID trouvé dans la console
 # resultat = fetch_agenda(mon_id)
 
 # if isinstance(resultat, list):
