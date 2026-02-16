@@ -1,3 +1,7 @@
+<<<<<<< HEAD
+=======
+
+>>>>>>> 3a534b5524d199bd250e7e4df0536cf3b844897f
 # EDT ESEO Backend
 
 Backend API pour la gestion des emplois du temps ESEO avec authentification sécurisée et synchronisation automatique.
@@ -158,7 +162,7 @@ edt_app_backend/
 
 ```bash
 # Vérifier les logs
-docker-compose logs edt-backend
+docker compose logs edt-backend
 
 # Accéder au container
 docker exec -it edt-backend bash
@@ -168,12 +172,12 @@ docker exec -it edt-backend bash
 
 ```bash
 # Vérifier les logs SWAG
-docker-compose logs swag
+docker compose logs swag
 
 # Regénérer les certificats
-docker-compose down
+docker compose down
 rm -rf swag/config/keys
-docker-compose up -d
+docker compose up -d
 ```
 
 ### Base de données corrompue
@@ -200,7 +204,7 @@ DATABASE_URL=sqlite:///./data/edt.db
 curl https://edt-api.votredomaine.com/health
 
 # Logs backend
-docker-compose logs -f edt-backend
+docker compose logs -f edt-backend
 
 # Logs nginx
 docker exec swag cat /config/log/nginx/access.log

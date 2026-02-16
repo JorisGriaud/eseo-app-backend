@@ -16,7 +16,7 @@ SQLite Database
 
 ```
 /opt/edt-eseo/
-├── docker-compose.yml
+├── docker compose.yml
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -184,11 +184,11 @@ edt-api.votredomaine.com → IP_SERVEUR
 cd /opt/edt-eseo
 
 # Build et démarrer
-docker-compose up -d --build
+docker compose up -d --build
 
 # Vérifier les logs
-docker-compose logs -f edt-backend
-docker-compose logs -f swag
+docker compose logs -f edt-backend
+docker compose logs -f swag
 ```
 
 ### Étape 5 : Vérifier le déploiement
@@ -205,22 +205,22 @@ curl https://edt-api.votredomaine.com/health
 
 ```bash
 # Voir les logs du backend
-docker-compose logs -f edt-backend
+docker compose logs -f edt-backend
 
 # Voir les logs de SWAG
-docker-compose logs -f swag
+docker compose logs -f swag
 
 # Redémarrer le backend
-docker-compose restart edt-backend
+docker compose restart edt-backend
 
 # Arrêter tous les services
-docker-compose down
+docker compose down
 
 # Mettre à jour le code
 cd /opt/edt-eseo/backend
 git pull  # ou copier les nouveaux fichiers
 cd ..
-docker-compose up -d --build edt-backend
+docker compose up -d --build edt-backend
 
 # Accéder au shell du backend
 docker exec -it edt-backend bash
@@ -256,7 +256,7 @@ openssl rand -hex 32
 
 # Mettre à jour .env
 # Redémarrer le backend
-docker-compose restart edt-backend
+docker compose restart edt-backend
 ```
 
 ## 📊 Monitoring
@@ -265,14 +265,14 @@ docker-compose restart edt-backend
 
 ```bash
 # Ajouter à crontab
-*/5 * * * * curl -f https://edt-api.votredomaine.com/health || systemctl restart docker-compose@edt
+*/5 * * * * curl -f https://edt-api.votredomaine.com/health || systemctl restart docker compose@edt
 ```
 
 ### Logs
 
 ```bash
 # Logs du backend en temps réel
-docker-compose logs -f --tail=100 edt-backend
+docker compose logs -f --tail=100 edt-backend
 
 # Logs nginx (SWAG)
 docker exec swag cat /config/log/nginx/access.log
@@ -287,8 +287,8 @@ docker exec swag cat /config/log/nginx/error.log
 cd /opt/edt-eseo/backend
 # Copier les nouveaux fichiers ou git pull
 cd ..
-docker-compose build edt-backend
-docker-compose up -d edt-backend
+docker compose build edt-backend
+docker compose up -d edt-backend
 ```
 
 ### Update des certificats SSL
@@ -301,7 +301,7 @@ SWAG renouvelle automatiquement les certificats Let's Encrypt. Rien à faire !
 
 ```bash
 # Vérifier les logs
-docker-compose logs edt-backend
+docker compose logs edt-backend
 
 # Vérifier que Playwright est installé
 docker exec -it edt-backend playwright --version
@@ -311,9 +311,9 @@ docker exec -it edt-backend playwright --version
 
 ```bash
 # Supprimer les certificats et les regénérer
-docker-compose down
+docker compose down
 rm -rf swag/config/keys
-docker-compose up -d
+docker compose up -d
 ```
 
 ### L'API ne répond pas

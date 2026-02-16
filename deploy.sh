@@ -24,10 +24,10 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Vérifier que docker-compose est installé
+# Vérifier que docker compose est installé
 check_dependencies() {
-    if ! command -v docker-compose &> /dev/null; then
-        log_error "docker-compose n'est pas installé"
+    if ! command -v docker compose &> /dev/null; then
+        log_error "docker compose n'est pas installé"
         exit 1
     fi
 }
@@ -49,24 +49,24 @@ start() {
     check_dependencies
     check_env
 
-    docker-compose up -d --build
+    docker compose up -d --build
 
     log_info "Services démarrés !"
     log_info "Vérification de l'état..."
     sleep 5
-    docker-compose ps
+    docker compose ps
 
     log_info ""
     log_info "📊 Commandes utiles :"
-    log_info "  - Logs backend: docker-compose logs -f edt-backend"
-    log_info "  - Logs SWAG: docker-compose logs -f swag"
+    log_info "  - Logs backend: docker compose logs -f edt-backend"
+    log_info "  - Logs SWAG: docker compose logs -f swag"
     log_info "  - Health check: curl https://edt-api.votredomaine.com/health"
 }
 
 # Arrêter les services
 stop() {
     log_info "Arrêt des services EDT ESEO..."
-    docker-compose down
+    docker compose down
     log_info "Services arrêtés !"
 }
 
@@ -82,7 +82,7 @@ restart() {
 logs() {
     SERVICE=${1:-edt-backend}
     log_info "Affichage des logs de $SERVICE..."
-    docker-compose logs -f --tail=100 "$SERVICE"
+    docker compose logs -f --tail=100 "$SERVICE"
 }
 
 # Backup de la base de données
@@ -130,13 +130,13 @@ restore() {
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         log_info "Arrêt du backend..."
-        docker-compose stop edt-backend
+        docker compose stop edt-backend
 
         log_info "Restauration du backup..."
         docker cp "$BACKUP_FILE" edt-backend:/app/data/edt.db
 
         log_info "Redémarrage du backend..."
-        docker-compose start edt-backend
+        docker compose start edt-backend
 
         log_info "✅ Backup restauré avec succès"
     else
@@ -152,21 +152,21 @@ update() {
     backup
 
     log_info "Reconstruction de l'image Docker..."
-    docker-compose build edt-backend
+    docker compose build edt-backend
 
     log_info "Redémarrage du backend..."
-    docker-compose up -d edt-backend
+    docker compose up -d edt-backend
 
     log_info "✅ Mise à jour terminée"
     log_info "Vérification de l'état..."
     sleep 3
-    docker-compose ps edt-backend
+    docker compose ps edt-backend
 }
 
 # Afficher l'état des services
 status() {
     log_info "État des services EDT ESEO :"
-    docker-compose ps
+    docker compose ps
 
     log_info ""
     log_info "Health check backend :"
