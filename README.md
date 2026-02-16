@@ -159,7 +159,7 @@ edt_app_backend/
 
 ```bash
 # Vérifier les logs
-docker-compose logs edt-backend
+docker compose logs edt-backend
 
 # Accéder au container
 docker exec -it edt-backend bash
@@ -169,12 +169,12 @@ docker exec -it edt-backend bash
 
 ```bash
 # Vérifier les logs SWAG
-docker-compose logs swag
+docker compose logs swag
 
 # Regénérer les certificats
-docker-compose down
+docker compose down
 rm -rf swag/config/keys
-docker-compose up -d
+docker compose up -d
 ```
 
 ### Base de données corrompue
@@ -201,7 +201,7 @@ DATABASE_URL=sqlite:///./data/edt.db
 curl https://edt-api.votredomaine.com/health
 
 # Logs backend
-docker-compose logs -f edt-backend
+docker compose logs -f edt-backend
 
 # Logs nginx
 docker exec swag cat /config/log/nginx/access.log
@@ -229,6 +229,3 @@ Développé avec ❤️ pour simplifier l'accès aux emplois du temps ESEO.
 - [SWAG Documentation](https://docs.linuxserver.io/general/swag)
 - [Playwright Python](https://playwright.dev/python/)
 - [APScheduler](https://apscheduler.readthedocs.io/)
-=======
-# eseo-backend-app
->>>>>>> ceae916791c2d3d0a064f9c80d3ec888d29ed58c
