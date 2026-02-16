@@ -1,4 +1,30 @@
 services:
+  # SWAG - Reverse proxy avec Let's Encrypt
+  swag:
+    image: lscr.io/linuxserver/swag:latest
+    container_name: swag
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Paris
+      - URL=votredomaine.com
+      - SUBDOMAINS=edt-api
+      - VALIDATION=http
+      - EMAIL=votre@email.com
+      - ONLY_SUBDOMAINS=false
+      - STAGING=false
+    volumes:
+      - ./swag/config:/config
+      - ./edt-api.subdomain.conf:/config/nginx/proxy-confs/edt-api.subdomain.conf:ro
+    ports:
+      - 443:443
+      - 80:80
+    restart: unless-stopped
+    networks:
+      - edt-network
+
   eseo-app-backend:
     build:
       context: .
