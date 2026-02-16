@@ -36,7 +36,7 @@ async def recuperer_json_planning():
         
         # On doit récupérer ton 'idUser' (le script JS du site le fait via un appel API)
         # Mais tu peux aussi le trouver une fois pour toute dans ton inspecteur !
-        id_user = "54024" 
+        id_user = "00000" 
 
         api_url = f"https://reverse-proxy.eseo.fr/API-SP/API/agenda/user/{date_debut}/{date_fin}/{id_user}"
 
