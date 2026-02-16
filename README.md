@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # EDT ESEO Backend
 
 Backend API pour la gestion des emplois du temps ESEO avec authentification sécurisée et synchronisation automatique.
@@ -217,7 +216,14 @@ docker exec swag cat /config/log/nginx/access.log
 
 ## 📄 License
 
-Ce projet est privé et destiné à un usage interne ESEO.
+Ce projet est sous license MIT. Voir le fichier [LICENSE](LICENSE) pour plus de détails.
+
+La license MIT permet :
+- ✅ Utilisation commerciale
+- ✅ Modification du code
+- ✅ Distribution
+- ✅ Usage privé
+- ℹ️ Attribution requise (garder le copyright)
 
 ## 👨‍💻 Auteur
 
@@ -229,6 +235,3 @@ Développé avec ❤️ pour simplifier l'accès aux emplois du temps ESEO.
 - [SWAG Documentation](https://docs.linuxserver.io/general/swag)
 - [Playwright Python](https://playwright.dev/python/)
 - [APScheduler](https://apscheduler.readthedocs.io/)
-=======
-# eseo-backend-app
->>>>>>> ceae916791c2d3d0a064f9c80d3ec888d29ed58c
