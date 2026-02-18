@@ -238,6 +238,108 @@ def sync_all_users():
         db.close()
 
 
+def _clean_course_name(course_name: str) -> str:
+    """
+    Clean and shorten course name for notification
+
+    Args:
+        course_name: Full course name from API
+
+    Returns:
+        Cleaned course name
+
+    Examples:
+        "Mathématiques - Travaux dirigés Groupe 1 (E2-Angers Gr1)" -> "Mathématiques"
+        "Projet d'électronique analogique - TP" -> "Projet d'électronique"
+    """
+    if not course_name:
+        return ""
+
+    # Remove everything after " - " (type de cours, groupe, etc.)
+    if " - " in course_name:
+        course_name = course_name.split(" - ")[0]
+
+    # Remove everything in parentheses
+    if "(" in course_name:
+        course_name = course_name.split("(")[0]
+
+    # Trim whitespace
+    course_name = course_name.strip()
+
+    # Limit length to 40 characters
+    if len(course_name) > 40:
+        course_name = course_name[:37] + "..."
+
+    return course_name
+
+
+def _create_change_notification_message(
+    db,
+    eseo_id: int,
+    start_datetime_utc: datetime,
+    end_datetime_utc: datetime,
+    upserted_count: int
+) -> str:
+    """
+    Create a personalized notification message with changed courses
+
+    Args:
+        db: Database session
+        eseo_id: User's ESEO ID
+        start_datetime_utc: Start of sync range
+        end_datetime_utc: End of sync range
+        upserted_count: Number of events upserted
+
+    Returns:
+        Formatted notification message with course names
+
+    Examples:
+        "Modification : Mathématiques"
+        "Modifications : Mathématiques, Physique"
+        "Modifications : Mathématiques, Physique et 2 autre(s)"
+    """
+    try:
+        # Get the most recent events (newly added/modified)
+        recent_events = db.query(Event).filter(
+            Event.eseo_id == eseo_id,
+            Event.debut >= start_datetime_utc,
+            Event.debut <= end_datetime_utc
+        ).order_by(Event.created_at.desc()).limit(5).all()
+
+        if not recent_events:
+            return "Votre emploi du temps a été mis à jour."
+
+        # Extract and clean unique course names
+        course_names = []
+        seen_names = set()
+
+        for event in recent_events:
+            if event.titre:
+                cleaned = _clean_course_name(event.titre)
+                if cleaned and cleaned not in seen_names:
+                    course_names.append(cleaned)
+                    seen_names.add(cleaned)
+
+        if not course_names:
+            return f"{upserted_count} modification(s) détectée(s)."
+
+        # Create message based on number of courses
+        if len(course_names) == 1:
+            return f"{course_names[0]}"
+        elif len(course_names) == 2:
+            return f"{course_names[0]}, {course_names[1]}"
+        elif len(course_names) == 3:
+            return f"{course_names[0]}, {course_names[1]}, {course_names[2]}"
+        else:
+            # More than 3 courses: show first 2 + count
+            remaining = len(course_names) - 2
+            return f"{course_names[0]}, {course_names[1]} et {remaining} autre(s)"
+
+    except Exception as e:
+        print(f"Error creating notification message: {e}")
+        return "Votre emploi du temps a été mis à jour."
+
+
 async def sync_user_schedule_v2(
     eseo_id: int,
     device_token: str = None,
@@ -310,10 +412,15 @@ async def sync_user_schedule_v2(
 
             # Send notification if device token available
             if device_token:
+                # Get new events to create personalized message
+                notification_message = _create_change_notification_message(
+                    db, eseo_id, start_datetime_utc, end_datetime_utc, upserted_count
+                )
+
                 send_firebase_notification(
                     device_token,
-                    "📅 Emploi du temps modifié",
-                    "Votre emploi du temps a été mis à jour."
+                    "Emploi du temps modifié",
+                    notification_message
                 )
 
         # Update user
