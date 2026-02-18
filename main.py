@@ -146,7 +146,7 @@ def event_to_dict(event: Event) -> dict:
         event: Event model instance
 
     Returns:
-        Dictionary with formatted event data
+        Dictionary with formatted event data including creation/update timestamps
     """
     return {
         "id": event.id,
@@ -156,7 +156,9 @@ def event_to_dict(event: Event) -> dict:
         "salle": event.salle,
         "professeur": event.professeur,
         "categorie_code": event.categorie_code,
-        "groupe": event.groupe
+        "groupe": event.groupe,
+        "created_at": format_datetime_for_response(event.created_at),
+        "updated_at": format_datetime_for_response(event.updated_at)
     }
 
 
