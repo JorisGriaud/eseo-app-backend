@@ -273,71 +273,124 @@ def _clean_course_name(course_name: str) -> str:
     return course_name
 
 
+def _format_time(dt_utc: datetime) -> str:
+    """
+    Format datetime to short time string in Paris timezone
+
+    Args:
+        dt_utc: Datetime in UTC
+
+    Returns:
+        Short time string (e.g., "9h", "14h30")
+
+    Examples:
+        datetime(2026, 2, 17, 8, 0) UTC -> "9h" (Paris)
+        datetime(2026, 2, 17, 13, 30) UTC -> "14h30" (Paris)
+    """
+    if not dt_utc:
+        return ""
+
+    # Convert to Paris timezone
+    dt_paris = dt_utc.astimezone(PARIS_TZ)
+
+    # Format as "9h" or "14h30"
+    if dt_paris.minute == 0:
+        return f"{dt_paris.hour}h"
+    else:
+        return f"{dt_paris.hour}h{dt_paris.minute:02d}"
+
+
 def _create_change_notification_message(
     db,
     eseo_id: int,
     start_datetime_utc: datetime,
     end_datetime_utc: datetime,
-    upserted_count: int
+    old_events_map: dict
 ) -> str:
     """
-    Create a personalized notification message with changed courses
+    Create a detailed notification message showing what changed with time ranges
 
     Args:
         db: Database session
         eseo_id: User's ESEO ID
         start_datetime_utc: Start of sync range
         end_datetime_utc: End of sync range
-        upserted_count: Number of events upserted
+        old_events_map: Dict mapping (debut, salle) -> (titre, fin) of old events
 
     Returns:
-        Formatted notification message with course names
+        Formatted notification message with specific changes and time ranges
 
     Examples:
-        "Modification : Mathématiques"
-        "Modifications : Mathématiques, Physique"
-        "Modifications : Mathématiques, Physique et 2 autre(s)"
+        "Mathématiques 9h-11h → Physique"
+        "Ajouté: Anglais 14h-16h"
+        "Annulé: Chimie 10h-12h"
+        "Mathématiques 9h-11h → Physique, Ajouté: Anglais 14h-16h"
     """
     try:
-        # Get the most recent events (newly added/modified)
-        recent_events = db.query(Event).filter(
+        # Get current events in the range
+        current_events = db.query(Event).filter(
             Event.eseo_id == eseo_id,
             Event.debut >= start_datetime_utc,
             Event.debut <= end_datetime_utc
-        ).order_by(Event.created_at.desc()).limit(5).all()
+        ).all()
 
-        if not recent_events:
-            return "Votre emploi du temps a été mis à jour."
+        # Create map of current events: (debut, salle) -> (titre, fin)
+        current_events_map = {
+            (event.debut, event.salle): (event.titre, event.fin)
+            for event in current_events
+        }
 
-        # Extract and clean unique course names
-        course_names = []
-        seen_names = set()
+        changes = []
 
-        for event in recent_events:
-            if event.titre:
-                cleaned = _clean_course_name(event.titre)
-                if cleaned and cleaned not in seen_names:
-                    course_names.append(cleaned)
-                    seen_names.add(cleaned)
+        # Detect replacements (same time/room, different course)
+        for key, old_data in old_events_map.items():
+            debut_utc, salle = key
+            old_titre, old_fin = old_data
 
-        if not course_names:
-            return f"{upserted_count} modification(s) détectée(s)."
+            if key in current_events_map:
+                new_titre, new_fin = current_events_map[key]
+                if old_titre != new_titre:
+                    old_clean = _clean_course_name(old_titre)
+                    new_clean = _clean_course_name(new_titre)
+                    if old_clean and new_clean and old_clean != new_clean:
+                        time_range = f"{_format_time(debut_utc)}-{_format_time(old_fin)}"
+                        changes.append(f"{old_clean} {time_range} → {new_clean}")
 
-        # Create message based on number of courses
-        if len(course_names) == 1:
-            return f"{course_names[0]}"
-        elif len(course_names) == 2:
-            return f"{course_names[0]}, {course_names[1]}"
-        elif len(course_names) == 3:
-            return f"{course_names[0]}, {course_names[1]}, {course_names[2]}"
+        # Detect additions (new time slots or rooms)
+        for key, new_data in current_events_map.items():
+            debut_utc, salle = key
+            new_titre, new_fin = new_data
+
+            if key not in old_events_map:
+                new_clean = _clean_course_name(new_titre)
+                if new_clean:
+                    time_range = f"{_format_time(debut_utc)}-{_format_time(new_fin)}"
+                    changes.append(f"Ajouté: {new_clean} {time_range}")
+
+        # Detect deletions (old events no longer present)
+        for key, old_data in old_events_map.items():
+            debut_utc, salle = key
+            old_titre, old_fin = old_data
+
+            if key not in current_events_map:
+                old_clean = _clean_course_name(old_titre)
+                if old_clean:
+                    time_range = f"{_format_time(debut_utc)}-{_format_time(old_fin)}"
+                    changes.append(f"Annulé: {old_clean} {time_range}")
+
+        if not changes:
+            return "Emploi du temps mis à jour"
+
+        # Limit to 3 changes to avoid too long notification
+        if len(changes) <= 3:
+            return ", ".join(changes)
         else:
-            # More than 3 courses: show first 2 + count
-            remaining = len(course_names) - 2
-            return f"{course_names[0]}, {course_names[1]} et {remaining} autre(s)"
+            # Show first 2 changes + count
+            return f"{changes[0]}, {changes[1]} et {len(changes) - 2} autre(s)"
 
     except Exception as e:
         print(f"Error creating notification message: {e}")
-        return "Votre emploi du temps a été mis à jour."
+        return "Emploi du temps mis à jour"
 
 
 async def sync_user_schedule_v2(
@@ -384,6 +437,19 @@ async def sync_user_schedule_v2(
             db, eseo_id, start_datetime_utc, end_datetime_utc
         )
 
+        # Capture old events BEFORE fetch (for change detection)
+        old_events = db.query(Event).filter(
+            Event.eseo_id == eseo_id,
+            Event.debut >= start_datetime_utc,
+            Event.debut <= end_datetime_utc
+        ).all()
+
+        # Create map of old events: (debut, salle) -> (titre, fin)
+        old_events_map = {
+            (event.debut, event.salle): (event.titre, event.fin)
+            for event in old_events
+        }
+
         # Fetch from API
         raw_events = await ESEOScraper.fetch_schedule_async(
             str(eseo_id),
@@ -412,9 +478,9 @@ async def sync_user_schedule_v2(
 
             # Send notification if device token available
             if device_token:
-                # Get new events to create personalized message
+                # Create detailed message showing what changed
                 notification_message = _create_change_notification_message(
-                    db, eseo_id, start_datetime_utc, end_datetime_utc, upserted_count
+                    db, eseo_id, start_datetime_utc, end_datetime_utc, old_events_map
                 )
 
                 send_firebase_notification(
