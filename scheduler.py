@@ -290,6 +290,10 @@ def _format_time(dt_utc: datetime) -> str:
     if not dt_utc:
         return ""
 
+    # If naive datetime (from SQLite), treat as UTC — same pattern as format_datetime_for_response()
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+
     # Convert to Paris timezone
     dt_paris = dt_utc.astimezone(PARIS_TZ)
 

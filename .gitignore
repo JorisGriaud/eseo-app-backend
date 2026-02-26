@@ -92,6 +92,7 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+test_changes.py
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -113,3 +114,6 @@ credentials/
 *firebase*.json
 serviceAccountKey.json
 FIREBASE-SETUP.md
+
+# Misc
+AGENDA_API_EXAMPLE.md
