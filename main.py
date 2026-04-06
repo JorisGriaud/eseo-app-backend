@@ -43,10 +43,20 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    """Login response with JWT token"""
-    access_token: str
+    """Login response - either JWT token (success) or MFA challenge"""
+    access_token: Optional[str] = None
     token_type: str = "bearer"
-    eseo_id: str
+    eseo_id: Optional[str] = None
+    mfa_required: bool = False
+    session_id: Optional[str] = None
+    mfa_type: Optional[str] = None  # "totp" or "push"
+    mfa_data: Optional[str] = None  # For push: the number to match
+
+
+class MFAVerifyRequest(BaseModel):
+    """MFA verification request"""
+    session_id: str = Field(..., description="Session ID from login response")
+    totp_code: Optional[str] = Field(None, description="6-digit TOTP code (required for TOTP, not for push)")
 
 
 class RegisterDeviceRequest(BaseModel):
@@ -243,50 +253,77 @@ async def health_check():
     )
 
 
-@app.post("/auth/login", response_model=LoginResponse)
-async def login(credentials: LoginRequest, db: Session = Depends(get_db)):
-    """
-    Authenticate user with ESEO credentials and return JWT token
-
-    Process:
-    1. Use Playwright to authenticate with Microsoft
-    2. Extract eseo_id from SharePoint
-    3. Create or update user in database
-    4. Return JWT token containing eseo_id
-
-    Note: Credentials are NOT stored - only used for authentication
-    """
-    # Extract ESEO ID using Playwright
-    eseo_id = await ESEOScraper.extract_eseo_id(credentials.email, credentials.password)
-
-    if not eseo_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or unable to extract ESEO ID"
-        )
-
-    # Check if user exists
+def _finalize_login(db: Session, eseo_id: str) -> LoginResponse:
+    """Create or update user and return JWT login response"""
     user = db.query(User).filter(User.eseo_id == int(eseo_id)).first()
 
     if not user:
-        # Create new user
         user = User(eseo_id=int(eseo_id))
         db.add(user)
         db.commit()
         db.refresh(user)
 
-    # Update last sync time
     user.last_sync = datetime.now(timezone.utc)
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
 
-    # Create JWT token
     access_token = create_access_token(data={"eseo_id": int(eseo_id)})
 
     return LoginResponse(
         access_token=access_token,
         eseo_id=eseo_id
     )
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(credentials: LoginRequest, db: Session = Depends(get_db)):
+    """
+    Authenticate user with ESEO credentials.
+
+    If MFA is enabled, returns mfa_required=true with a session_id.
+    The client must then call /auth/mfa/verify with the session_id and TOTP code.
+
+    If no MFA, returns JWT token directly.
+    """
+    result = await ESEOScraper.start_login(credentials.email, credentials.password)
+
+    if "error" in result:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=result["error"]
+        )
+
+    if result.get("mfa_required"):
+        return LoginResponse(
+            mfa_required=True,
+            session_id=result["session_id"],
+            mfa_type=result.get("mfa_type"),
+            mfa_data=result.get("mfa_data")
+        )
+
+    # No MFA needed - direct login
+    return _finalize_login(db, result["eseo_id"])
+
+
+@app.post("/auth/mfa/verify", response_model=LoginResponse)
+async def verify_mfa(request: MFAVerifyRequest, db: Session = Depends(get_db)):
+    """
+    Complete MFA verification and return JWT token.
+
+    For TOTP: send session_id + totp_code (6-digit code from authenticator app)
+    For push: send session_id only (backend waits for approval on phone)
+
+    On wrong TOTP code, returns 401 - client can retry with the same session_id.
+    """
+    result = await ESEOScraper.complete_mfa(request.session_id, request.totp_code)
+
+    if "error" in result:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=result["error"]
+        )
+
+    return _finalize_login(db, result["eseo_id"])
 
 
 @app.post("/auth/register-device")
