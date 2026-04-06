@@ -273,35 +273,45 @@ def _clean_course_name(course_name: str) -> str:
     return course_name
 
 
-def _format_time(dt_utc: datetime) -> str:
-    """
-    Format datetime to short time string in Paris timezone
-
-    Args:
-        dt_utc: Datetime in UTC
-
-    Returns:
-        Short time string (e.g., "9h", "14h30")
-
-    Examples:
-        datetime(2026, 2, 17, 8, 0) UTC -> "9h" (Paris)
-        datetime(2026, 2, 17, 13, 30) UTC -> "14h30" (Paris)
-    """
+def _to_paris(dt_utc: datetime) -> datetime:
+    """Convert a datetime (possibly naive from SQLite) to Paris timezone"""
     if not dt_utc:
-        return ""
-
-    # If naive datetime (from SQLite), treat as UTC — same pattern as format_datetime_for_response()
+        return None
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    return dt_utc.astimezone(PARIS_TZ)
 
-    # Convert to Paris timezone
-    dt_paris = dt_utc.astimezone(PARIS_TZ)
 
-    # Format as "9h" or "14h30"
+def _format_time(dt_utc: datetime) -> str:
+    """Format datetime to short time string in Paris timezone (e.g. '9h', '14h30')"""
+    dt_paris = _to_paris(dt_utc)
+    if not dt_paris:
+        return ""
     if dt_paris.minute == 0:
         return f"{dt_paris.hour}h"
-    else:
-        return f"{dt_paris.hour}h{dt_paris.minute:02d}"
+    return f"{dt_paris.hour}h{dt_paris.minute:02d}"
+
+
+def _format_date(dt_utc: datetime) -> str:
+    """Format datetime to short date string in Paris timezone (e.g. '09/02', '15/04')"""
+    dt_paris = _to_paris(dt_utc)
+    if not dt_paris:
+        return ""
+    return f"{dt_paris.day:02d}/{dt_paris.month:02d}"
+
+
+def _format_change(change_type: str, debut_utc: datetime, fin_utc: datetime, old_name: str = None, new_name: str = None) -> str:
+    """Format a single change line with date, time range, and course names"""
+    date_str = _format_date(debut_utc)
+    time_range = f"{_format_time(debut_utc)}-{_format_time(fin_utc)}"
+
+    if change_type == "replace":
+        return f"{date_str} {old_name} {time_range} -> {new_name}"
+    elif change_type == "add":
+        return f"{date_str} Ajoute: {new_name} {time_range}"
+    elif change_type == "cancel":
+        return f"{date_str} Annule: {old_name} {time_range}"
+    return ""
 
 
 def _create_change_notification_message(
@@ -312,33 +322,20 @@ def _create_change_notification_message(
     old_events_map: dict
 ) -> str:
     """
-    Create a detailed notification message showing what changed with time ranges
+    Create a detailed notification message showing what changed, with date and time.
 
-    Args:
-        db: Database session
-        eseo_id: User's ESEO ID
-        start_datetime_utc: Start of sync range
-        end_datetime_utc: End of sync range
-        old_events_map: Dict mapping (debut, salle) -> (titre, fin) of old events
-
-    Returns:
-        Formatted notification message with specific changes and time ranges
-
-    Examples:
-        "Mathématiques 9h-11h → Physique"
-        "Ajouté: Anglais 14h-16h"
-        "Annulé: Chimie 10h-12h"
-        "Mathématiques 9h-11h → Physique, Ajouté: Anglais 14h-16h"
+    Format examples:
+        "09/02 Maths 8h-10h -> Physique"
+        "09/02 Ajoute: Anglais 14h-16h"
+        "09/02 Annule: Chimie 10h-12h"
     """
     try:
-        # Get current events in the range
         current_events = db.query(Event).filter(
             Event.eseo_id == eseo_id,
             Event.debut >= start_datetime_utc,
             Event.debut <= end_datetime_utc
         ).all()
 
-        # Create map of current events: (debut, salle) -> (titre, fin)
         current_events_map = {
             (event.debut, event.salle): (event.titre, event.fin)
             for event in current_events
@@ -346,55 +343,50 @@ def _create_change_notification_message(
 
         changes = []
 
-        # Detect replacements (same time/room, different course)
+        # Replacements
         for key, old_data in old_events_map.items():
             debut_utc, salle = key
             old_titre, old_fin = old_data
-
             if key in current_events_map:
                 new_titre, new_fin = current_events_map[key]
                 if old_titre != new_titre:
                     old_clean = _clean_course_name(old_titre)
                     new_clean = _clean_course_name(new_titre)
                     if old_clean and new_clean and old_clean != new_clean:
-                        time_range = f"{_format_time(debut_utc)}-{_format_time(old_fin)}"
-                        changes.append(f"{old_clean} {time_range} → {new_clean}")
+                        changes.append(_format_change("replace", debut_utc, old_fin, old_clean, new_clean))
 
-        # Detect additions (new time slots or rooms)
+        # Additions
         for key, new_data in current_events_map.items():
             debut_utc, salle = key
             new_titre, new_fin = new_data
-
             if key not in old_events_map:
                 new_clean = _clean_course_name(new_titre)
                 if new_clean:
-                    time_range = f"{_format_time(debut_utc)}-{_format_time(new_fin)}"
-                    changes.append(f"Ajouté: {new_clean} {time_range}")
+                    changes.append(_format_change("add", debut_utc, new_fin, new_name=new_clean))
 
-        # Detect deletions (old events no longer present)
+        # Deletions
         for key, old_data in old_events_map.items():
             debut_utc, salle = key
             old_titre, old_fin = old_data
-
             if key not in current_events_map:
                 old_clean = _clean_course_name(old_titre)
                 if old_clean:
-                    time_range = f"{_format_time(debut_utc)}-{_format_time(old_fin)}"
-                    changes.append(f"Annulé: {old_clean} {time_range}")
+                    changes.append(_format_change("cancel", debut_utc, old_fin, old_name=old_clean))
 
         if not changes:
-            return "Emploi du temps mis à jour"
+            return "Emploi du temps mis a jour"
 
-        # Limit to 3 changes to avoid too long notification
+        # Sort by date (the date prefix ensures correct ordering)
+        changes.sort()
+
         if len(changes) <= 3:
-            return ", ".join(changes)
+            return "\n".join(changes)
         else:
-            # Show first 2 changes + count
-            return f"{changes[0]}, {changes[1]} et {len(changes) - 2} autre(s)"
+            return f"{changes[0]}\n{changes[1]}\net {len(changes) - 2} autre(s) changement(s)"
 
     except Exception as e:
         print(f"Error creating notification message: {e}")
-        return "Emploi du temps mis à jour"
+        return "Emploi du temps mis a jour"
 
 
 async def sync_user_schedule_v2(
