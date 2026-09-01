@@ -53,6 +53,26 @@ async def _cleanup_expired_mfa_sessions():
         print(f"Cleaned up expired MFA session: {sid[:8]}...")
 
 
+async def mfa_cleanup_loop(interval_seconds: int = 60):
+    """
+    Periodically close and discard expired MFA sessions.
+
+    Each MFASession holds a live headless Chromium process. Without this loop,
+    expired sessions were only ever cleaned up on-demand at the start of the
+    next start_login() call - an abandoned MFA flow (user closes the app
+    mid-verification) would leak its browser process indefinitely if no one
+    else happens to log in afterwards. Must run on the app's own asyncio event
+    loop (not a separate thread) since Playwright objects are bound to the
+    loop that created them.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await _cleanup_expired_mfa_sessions()
+        except Exception as e:
+            print(f"Error during periodic MFA session cleanup: {e}")
+
+
 class ESEOScraper:
     """
     Handles all interactions with ESEO SharePoint and EDT API

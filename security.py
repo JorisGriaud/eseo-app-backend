@@ -4,13 +4,22 @@ Handles authentication tokens to prevent ID usurpation
 """
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import time
 import jwt
 from passlib.context import CryptContext
 import os
+from dotenv import load_dotenv
 
-# Secret key for JWT signing - MUST be changed in production
+load_dotenv()
+
+# Secret key for JWT signing - required, no insecure fallback.
 # Generate with: openssl rand -hex 32
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "eb36532d36a7c825a249d3aaef288a3bbc762660563bb5946ba40150a756af26")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY environment variable is not set. "
+        "Generate one with `openssl rand -hex 32` and set it before starting the app."
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30  # Token validity period
 
@@ -102,3 +111,36 @@ def get_password_hash(password: str) -> str:
     Kept for potential future use
     """
     return pwd_context.hash(password)
+
+
+class RateLimiter:
+    """
+    Simple in-memory sliding-window rate limiter.
+
+    Suitable for this app's single-worker deployment (required anyway for
+    APScheduler compatibility, see Dockerfile). Not shared across processes -
+    if the app is ever scaled to multiple workers/instances, replace with a
+    shared store (e.g. Redis).
+    """
+
+    def __init__(self, max_attempts: int, window_seconds: float):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._attempts: dict[str, list[float]] = {}
+
+    def check(self, key: str) -> bool:
+        """
+        Record an attempt for `key` and return True if it's allowed,
+        False if the caller has exceeded max_attempts within the window.
+        """
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        attempts = [t for t in self._attempts.get(key, []) if t >= cutoff]
+
+        if len(attempts) >= self.max_attempts:
+            self._attempts[key] = attempts
+            return False
+
+        attempts.append(now)
+        self._attempts[key] = attempts
+        return True
