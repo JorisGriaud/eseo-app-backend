@@ -3,12 +3,13 @@ Utility functions for EDT application
 Date calculations and helper functions
 """
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Dict
 import pytz
 import hashlib
 import json
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
+from bs4 import BeautifulSoup
 
 
 def get_date_range(weeks: int = 4) -> tuple[str, str]:
@@ -195,3 +196,121 @@ def calculate_schedule_hash_for_range(
     ], sort_keys=True)
 
     return hashlib.md5(events_str.encode()).hexdigest()
+
+
+def calculate_notes_hash(db: Session, eseo_id: int, semester_code: Optional[str] = None) -> str:
+    """
+    Calculate MD5 hash of a user's notes snapshot for one semester.
+
+    Unlike calculate_schedule_hash_for_range, there's no date range: notes
+    aren't calendar-scoped like schedule events. But since a user's Note rows
+    now span every semester ESEO has a record for (see database.Note's
+    semester_code), this MUST be scoped to one semester - otherwise a hash
+    covering the whole table would never stabilize (historical semesters get
+    (re)upserted at every login) and would make an unrelated semester's data
+    look like a change to the current one.
+    """
+    from database import Note
+
+    notes = db.query(Note).filter(
+        Note.eseo_id == eseo_id, Note.semester_code == semester_code
+    ).order_by(Note.external_key).all()
+
+    notes_str = json.dumps([
+        {
+            "external_key": n.external_key,
+            "libelle": n.libelle,
+            "valeur": n.valeur,
+            "coefficient": n.coefficient,
+        }
+        for n in notes
+    ], sort_keys=True)
+
+    return hashlib.md5(notes_str.encode()).hexdigest()
+
+
+def parse_bulletin_html(html: str) -> Dict:
+    """
+    Extracts structured data from the "Bulletin provisoire" HTML document
+    returned by reverse-proxy.eseo.fr/API-SP/api/bulletin/getBulletinByEtu -
+    a print-oriented page (external fonts, print CSS), not something to
+    embed as-is in the app. This pulls out just what the UI needs to render
+    a native summary: student name, UE-level averages/ECTS/grade (not
+    available anywhere in the getUE notes API), and the overall synthesis.
+
+    Structure observed live (see database.Note for the getUE side of things,
+    which only has individual evaluations, not these UE/overall aggregates):
+        <h1>{student name}</h1>
+        <h3>Bulletin de notes provisoire de {semester label}</h3>
+        <table class="tableUF">
+          <tr class="ligneUE">
+            <td class="matiere" colspan="3">{UE name}</td>
+            <td class="moyenne" rowspan="N">{UE average, often empty}</td>
+            <td class="ects" rowspan="N">/{ects total}</td>
+            <td class="grade" rowspan="N">{letter grade, often empty}</td>
+          </tr>
+          <tr><td class="eval">{eval name}</td><td>{coef}</td><td>{value}</td></tr>
+          ... (one per evaluation in that UE)
+        <table class="tableSynthese">
+          ... overall Moyenne / Classement / Total ECTS cells
+
+        Returns a plain dict (not a Pydantic model - this is assembled
+        fresh per request, never stored), always with every key present
+        even on a parse failure (empty ues list, None elsewhere) so the
+        caller never needs to special-case a malformed document.
+    """
+    result: Dict = {"student_name": None, "title": None, "ues": [], "synthese": None}
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        h1 = soup.find("h1")
+        if h1:
+            result["student_name"] = h1.get_text(strip=True)
+
+        h3 = soup.find("h3")
+        if h3:
+            result["title"] = h3.get_text(strip=True)
+
+        table = soup.find("table", class_="tableUF")
+        if table:
+            current_ue: Optional[Dict] = None
+            for tr in table.find_all("tr"):
+                classes = tr.get("class") or []
+                if "ligneUE" in classes:
+                    matiere = tr.find("td", class_="matiere")
+                    moyenne = tr.find("td", class_="moyenne")
+                    ects = tr.find("td", class_="ects")
+                    grade = tr.find("td", class_="grade")
+                    current_ue = {
+                        "nom": matiere.get_text(strip=True) if matiere else None,
+                        "moyenne": (moyenne.get_text(strip=True) or None) if moyenne else None,
+                        "ects": ects.get_text(strip=True) if ects else None,
+                        "grade": (grade.get_text(strip=True) or None) if grade else None,
+                        "evaluations": [],
+                    }
+                    result["ues"].append(current_ue)
+                elif current_ue is not None and tr.find("td", class_="eval"):
+                    cells = tr.find_all("td")
+                    current_ue["evaluations"].append({
+                        "libelle": cells[0].get_text(strip=True) if len(cells) > 0 else None,
+                        "coefficient": (cells[1].get_text(strip=True) or None) if len(cells) > 1 else None,
+                        "valeur": (cells[2].get_text(strip=True) or None) if len(cells) > 2 else None,
+                    })
+
+        synth_table = soup.find("table", class_="tableSynthese")
+        if synth_table:
+            rows = synth_table.find_all("tr")
+            if len(rows) >= 2:
+                cells = rows[1].find_all("td")
+                if len(cells) >= 3:
+                    result["synthese"] = {
+                        "moyenne": cells[0].get_text(strip=True),
+                        "classement": cells[1].get_text(strip=True),
+                        "ects": cells[2].get_text(strip=True),
+                    }
+
+    except Exception as e:
+        print(f"Error parsing bulletin HTML: {e}")
+
+    return result

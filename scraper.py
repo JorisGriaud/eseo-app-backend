@@ -5,6 +5,7 @@ Handles authentication and data extraction from ESEO systems
 import asyncio
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
@@ -147,8 +148,263 @@ class ESEOScraper:
             attempts += 1
 
         if id_user and id_user != "00000":
-            return {"success": True, "eseo_id": str(id_user)}
+            result = {"success": True, "eseo_id": str(id_user)}
+            result["notes"] = await ESEOScraper._capture_notes_session(page)
+            return result
         return {"error": "Impossible d'extraire l'identifiant ESEO"}
+
+    # ── Notes fetching ────────────────────────────────────────────────
+    #
+    # Unlike the schedule (a public API keyed by eseo_id, no auth needed),
+    # the notes API requires a live Microsoft SSO session: confirmed via a
+    # live capture that reverse-proxy.eseo.fr's getUE endpoint authenticates
+    # via a short-lived "Authorization: Bearer <JWT>" header minted client-side
+    # by MSAL.js from its localStorage token cache - NOT a static/replayable
+    # cookie. Plain httpx + cookie replay does not work (reverse-proxy.eseo.fr
+    # has no cookies at all in the captured session). What DOES work (verified
+    # live): restoring a Playwright context from a stored storage_state
+    # (cookies + localStorage, which includes MSAL's cache) lets MSAL silently
+    # re-acquire a fresh access token with no re-login/MFA, as long as the
+    # underlying Microsoft SSO session is still alive. So every notes fetch -
+    # whether right after login or in a background job days later - goes
+    # through an actual (headless) browser page load of Mes-notes.aspx.
+
+    NOTES_URL = "https://reseaueseo.sharepoint.com/sites/etu/Pages/Mes-notes.aspx"
+    NOTES_CODE_PATTERN = re.compile(r"/api/notes/getue/(\d+)/(\d+)", re.IGNORECASE)
+    # Matches the sidebar's semester/year entries on Mes-notes.aspx (e.g.
+    # "E3e Angers - Semestre 6 - Année 2026-2027") - confirmed live that each
+    # one is its own {code} in the getUE URL, with no derivable pattern
+    # between them (not sequential, not a function of the semester number),
+    # so the only way to know a code is to actually click that entry once.
+    SEMESTER_LABEL_LOCATOR = "text=/Semestre|Année scolaire/i"
+
+    @staticmethod
+    async def _fetch_notes_from_page(page) -> dict:
+        """
+        Navigates an already-authenticated page to Mes-notes.aspx and
+        intercepts the getUE XHR the page's own JS fires for whichever
+        semester is selected by default, returning its parsed JSON plus that
+        semester's {code}. Shared by _fetch_all_semesters_from_page and
+        fetch_notes_async (current-semester-only background/on-demand fetch).
+
+        Returns:
+            {"status": "ok", "notes": [...], "code": "97568"}
+            {"status": "session_expired"}         - redirected to Microsoft
+                login instead of loading the notes grid (stored session no
+                longer valid)
+            {"status": "error", "detail": "..."}  - anything else (timeout,
+                network issue, page structure changed) - transient, don't
+                invalidate the stored session over this alone
+        """
+        try:
+            async with page.expect_request(
+                lambda r: "/api/notes/getue/" in r.url.lower(), timeout=20000
+            ) as req_info:
+                await page.goto(ESEOScraper.NOTES_URL, timeout=25000)
+
+            request = await req_info.value
+            response = await request.response()
+
+            if response is None or response.status != 200:
+                status = response.status if response else None
+                if "login.microsoftonline.com" in page.url or "login.live.com" in page.url:
+                    return {"status": "session_expired"}
+                return {"status": "error", "detail": f"HTTP status {status}"}
+
+            notes = await response.json()
+            match = ESEOScraper.NOTES_CODE_PATTERN.search(request.url)
+            code = match.group(1) if match else None
+            return {"status": "ok", "notes": notes, "code": code}
+
+        except Exception as e:
+            if "login.microsoftonline.com" in page.url or "login.live.com" in page.url:
+                return {"status": "session_expired"}
+            return {"status": "error", "detail": str(e)}
+
+    @staticmethod
+    async def _fetch_all_semesters_from_page(page) -> dict:
+        """
+        Like _fetch_notes_from_page, but also discovers and fetches every
+        OTHER semester/year listed in the sidebar (confirmed live: reading
+        the sidebar and clicking through it is the only way to learn each
+        one's {code} - see SEMESTER_LABEL_LOCATOR). Used at login time only
+        (see _capture_notes_session) - periodic background checks stay
+        scoped to the current semester alone via fetch_notes_async, since
+        historical semesters' grades don't change and don't need re-crawling
+        every few hours.
+
+        Returns:
+            {"status": "ok", "semesters": [{"code", "label", "notes"}, ...]}
+                - semesters[0] is always the default/current semester.
+            {"status": "session_expired"} / {"status": "error", ...} - same
+                as _fetch_notes_from_page, if even the default fetch fails.
+        """
+        default = await ESEOScraper._fetch_notes_from_page(page)
+        if default["status"] != "ok":
+            return default
+
+        semesters = [{"code": default["code"], "label": None, "notes": default["notes"]}]
+
+        try:
+            candidates = await page.locator(ESEOScraper.SEMESTER_LABEL_LOCATOR).all()
+            labels = []
+            for el in candidates:
+                try:
+                    text = (await el.inner_text()).strip()
+                    if text and text not in labels:
+                        labels.append(text)
+                except Exception:
+                    pass
+
+            for label in labels:
+                try:
+                    async with page.expect_request(
+                        lambda r: "/api/notes/getue/" in r.url.lower(), timeout=8000
+                    ) as req_info:
+                        await page.get_by_text(label, exact=True).first.click(timeout=5000)
+                    request = await req_info.value
+                    response = await request.response()
+                    if response is None or response.status != 200:
+                        continue
+                    match = ESEOScraper.NOTES_CODE_PATTERN.search(request.url)
+                    code = match.group(1) if match else None
+                    notes = await response.json()
+
+                    if code == semesters[0]["code"]:
+                        semesters[0]["label"] = label
+                    else:
+                        semesters.append({"code": code, "label": label, "notes": notes})
+                except Exception as e:
+                    print(f"Failed to fetch semester {label!r} (non-fatal): {e}")
+        except Exception as e:
+            print(f"Semester discovery failed (non-fatal, current semester still captured): {e}")
+
+        return {"status": "ok", "semesters": semesters}
+
+    @staticmethod
+    async def _capture_notes_session(page) -> dict:
+        """
+        Called right after a successful login/MFA, while the browser is
+        still open. Fetches the user's full notes snapshot across every
+        semester AND captures storage_state for later background reuse, in
+        one round trip. Never raises - a failure here must not break login;
+        it just means notes stay unavailable for this user until their next
+        login.
+
+        Returns the same shape as _fetch_all_semesters_from_page, plus
+        "session_state" on success.
+        """
+        result = await ESEOScraper._fetch_all_semesters_from_page(page)
+        if result["status"] == "ok":
+            try:
+                result["session_state"] = json.dumps(await page.context.storage_state())
+            except Exception as e:
+                print(f"Failed to capture notes session state: {e}")
+        return result
+
+    @staticmethod
+    async def fetch_notes_async(session_state_json: str) -> dict:
+        """
+        Background/on-demand notes fetch using a previously stored session -
+        no email/password/MFA needed, as long as the underlying Microsoft
+        SSO session is still alive. Launches its own throwaway headless
+        browser (seeded with the stored storage_state) since no live login
+        page exists at this point. On success, also returns a refreshed
+        session_state (MSAL may rotate tokens/cookies on use) so the caller
+        can extend the stored session's effective lifetime.
+        """
+        try:
+            storage_state = json.loads(session_state_json)
+        except Exception as e:
+            return {"status": "error", "detail": f"corrupt session_state: {e}"}
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(storage_state=storage_state)
+            page = await context.new_page()
+            result = await ESEOScraper._fetch_notes_from_page(page)
+            if result["status"] == "ok":
+                try:
+                    result["session_state"] = json.dumps(await context.storage_state())
+                except Exception as e:
+                    print(f"Failed to refresh notes session state: {e}")
+            return result
+        finally:
+            await browser.close()
+            await p.stop()
+
+    @staticmethod
+    async def fetch_bulletin_async(session_state_json: str, semester_label: Optional[str] = None) -> dict:
+        """
+        Fetches the "Bulletin provisoire" (a print-oriented HTML document -
+        see utils.parse_bulletin_html for turning it into structured data)
+        for one semester, using a stored session. On-demand only (not
+        crawled for every semester at login like notes are - a bulletin
+        fetch is a full page load + two more clicks, and is only needed when
+        the user actually opens the bulletin screen).
+
+        If semester_label is given and isn't the default/current semester,
+        clicks that semester's sidebar entry first (same reasoning as
+        _fetch_all_semesters_from_page: there's no URL to construct
+        directly, only a label to click).
+
+        Returns:
+            {"status": "ok", "html": "<standalone HTML document>"}
+            {"status": "session_expired"} / {"status": "error", "detail": ...}
+        """
+        try:
+            storage_state = json.loads(session_state_json)
+        except Exception as e:
+            return {"status": "error", "detail": f"corrupt session_state: {e}"}
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        page = None
+        try:
+            context = await browser.new_context(storage_state=storage_state)
+            page = await context.new_page()
+
+            async with page.expect_request(
+                lambda r: "/api/notes/getue/" in r.url.lower(), timeout=20000
+            ):
+                await page.goto(ESEOScraper.NOTES_URL, timeout=25000)
+
+            if semester_label:
+                try:
+                    async with page.expect_request(
+                        lambda r: "/api/notes/getue/" in r.url.lower(), timeout=8000
+                    ):
+                        await page.get_by_text(semester_label, exact=True).first.click(timeout=5000)
+                except Exception as e:
+                    print(f"Could not switch to semester {semester_label!r} for bulletin "
+                          f"(non-fatal, falling back to the default semester): {e}")
+
+            async with page.expect_request(
+                lambda r: "/api/bulletin/getbulletinbyetu/" in r.url.lower(), timeout=10000
+            ) as req_info:
+                await page.get_by_text("Bulletin provisoire", exact=False).first.click(timeout=5000)
+
+            request = await req_info.value
+            response = await request.response()
+
+            if response is None or response.status != 200:
+                status = response.status if response else None
+                if "login.microsoftonline.com" in page.url or "login.live.com" in page.url:
+                    return {"status": "session_expired"}
+                return {"status": "error", "detail": f"HTTP status {status}"}
+
+            body = await response.json()
+            html = body.get("Html") or body.get("Header") or ""
+            return {"status": "ok", "html": html}
+
+        except Exception as e:
+            if page is not None and ("login.microsoftonline.com" in page.url or "login.live.com" in page.url):
+                return {"status": "session_expired"}
+            return {"status": "error", "detail": str(e)}
+        finally:
+            await browser.close()
+            await p.stop()
 
     @staticmethod
     async def start_login(email: str, password: str) -> dict:

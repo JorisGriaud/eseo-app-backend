@@ -7,6 +7,7 @@ from typing import Optional
 import time
 import jwt
 from passlib.context import CryptContext
+from cryptography.fernet import Fernet, InvalidToken
 import os
 from dotenv import load_dotenv
 
@@ -24,6 +25,39 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30  # Token validity period
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Key encrypting the cached ESEO browser session (cookies + MSAL token cache)
+# used to check for new notes/grades in the background without requiring the
+# user to log in again. This is a more sensitive artifact than the JWT - it's
+# effectively a live ESEO session - so it's required with no insecure
+# fallback, same as JWT_SECRET_KEY.
+# Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+COOKIE_ENCRYPTION_KEY = os.getenv("COOKIE_ENCRYPTION_KEY")
+if not COOKIE_ENCRYPTION_KEY:
+    raise RuntimeError(
+        "COOKIE_ENCRYPTION_KEY environment variable is not set. "
+        "Generate one with `python -c \"from cryptography.fernet import Fernet; "
+        "print(Fernet.generate_key().decode())\"` and set it before starting the app."
+    )
+_fernet = Fernet(COOKIE_ENCRYPTION_KEY.encode())
+
+
+def encrypt_session_state(raw: str) -> str:
+    """Encrypt a serialized Playwright storage_state JSON blob before storing it on User."""
+    return _fernet.encrypt(raw.encode()).decode()
+
+
+def decrypt_session_state(token: str) -> Optional[str]:
+    """
+    Decrypt a stored session blob.
+
+    Returns None if decryption fails (corrupted value, or the encryption key
+    was rotated) - callers treat this the same as "no session stored".
+    """
+    try:
+        return _fernet.decrypt(token.encode()).decode()
+    except (InvalidToken, ValueError):
+        return None
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

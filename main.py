@@ -15,17 +15,27 @@ import json
 import os
 
 import sync_coordination
-from database import get_db, init_db, User, Event, ScheduleChange
-from security import create_access_token, verify_token, get_eseo_id_from_token, RateLimiter
+from database import get_db, init_db, User, Event, ScheduleChange, Note
+from security import (
+    create_access_token, verify_token, get_eseo_id_from_token, RateLimiter,
+    encrypt_session_state, decrypt_session_state,
+)
 from scraper import ESEOScraper, mfa_cleanup_loop
 from scheduler import (
     start_scheduler,
     stop_scheduler,
     maybe_sync_and_notify,
+    maybe_sync_and_notify_notes,
+    sync_user_notes,
     _capture_pre_sync_state,
     _notify_if_changed,
+    _capture_pre_sync_notes_state,
+    _notify_if_notes_changed,
 )
-from utils import PARIS_TZ, parse_eseo_datetime, format_datetime_for_response, calculate_schedule_hash_for_range
+from utils import (
+    PARIS_TZ, parse_eseo_datetime, format_datetime_for_response, calculate_schedule_hash_for_range,
+    parse_bulletin_html,
+)
 
 # FastAPI app initialization
 app = FastAPI(
@@ -97,6 +107,34 @@ class AgendaResponse(BaseModel):
     end_date: str
     source: str  # "cache" or "api"
     fetched_at: str
+
+
+class NotesResponse(BaseModel):
+    """Notes response with cache-first strategy, mirrors AgendaResponse"""
+    notes: List[dict]
+    source: str          # "cache" or "api"
+    fetched_at: str
+    # False if no ESEO session has ever been captured for this user, or it
+    # went stale - notes checking is silently paused until their next login,
+    # this is never surfaced as an error.
+    session_valid: bool
+
+
+class BulletinResponse(BaseModel):
+    """
+    Structured "Bulletin provisoire" for one semester (see
+    utils.parse_bulletin_html) plus the original raw HTML for the app's
+    "share/open" button. Always a live fetch, no caching (see GET
+    /notes/bulletin) - status="unavailable" covers every reason it couldn't
+    be fetched (no session, expired session, transient failure), since none
+    of those are actionable differently from the app's point of view.
+    """
+    status: str  # "ok" | "unavailable"
+    student_name: Optional[str] = None
+    title: Optional[str] = None
+    ues: List[dict] = []
+    synthese: Optional[dict] = None
+    html: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -525,6 +563,164 @@ def propagate_group_events(
     return affected
 
 
+def note_to_dict(note: Note) -> dict:
+    """Convert Note model to dictionary for API response, mirrors event_to_dict."""
+    return {
+        "id": note.id,
+        "external_key": note.external_key,
+        "ue_nom": note.ue_nom,
+        "ue_code": note.ue_code,
+        "libelle": note.libelle,
+        "valeur": note.valeur,
+        "coefficient": note.coefficient,
+        "created_at": format_datetime_for_response(note.created_at),
+        "updated_at": format_datetime_for_response(note.updated_at),
+    }
+
+
+def _upsert_single_note(
+    db: Session, eseo_id: int, ue: Dict, evaluation: Dict, semester_code: Optional[str], semester_label: Optional[str]
+) -> Optional[tuple[int, bool]]:
+    """
+    Insert or update a single evaluation for one user, mirrors
+    _upsert_single_event. `ue` is the parent UE object (denormalized onto
+    each row as ue_nom/ue_code for display grouping), `evaluation` is one
+    entry from that UE's `Contenu` list.
+
+    The lookup IS scoped by semester_code, unlike a first attempt at this
+    that wasn't: confirmed live that ESEO reuses the SAME "intIdEvaluation"
+    across semesters for an aggregate view that summarizes others (e.g. an
+    "Annee scolaire" view shares ids with the "Semestre 5"/"Semestre 6" views
+    it aggregates) - without this scoping, upserting one semester silently
+    re-tags (steals) another semester's already-stored rows via a matching
+    external_key, corrupting both.
+
+    Returns (note_id, changed), or None if the evaluation has no usable id.
+    """
+    try:
+        raw_id = evaluation.get("intIdEvaluation")
+        if raw_id is None:
+            print(f"Skipping evaluation with no intIdEvaluation: {evaluation}")
+            return None
+        external_key = str(raw_id)
+
+        titre = evaluation.get("strTitre") or "Sans titre"
+        valeur = evaluation.get("strValeur")
+        coefficient = evaluation.get("decCoefficient")
+
+        existing = db.query(Note).filter(
+            and_(Note.eseo_id == eseo_id, Note.external_key == external_key, Note.semester_code == semester_code)
+        ).first()
+
+        if existing:
+            new_values = {
+                "libelle": titre,
+                "valeur": str(valeur) if valeur not in (None, "") else None,
+                "coefficient": str(coefficient) if coefficient is not None else None,
+                "ue_nom": ue.get("strNom"),
+                "ue_code": ue.get("strCode"),
+                "semester_label": semester_label or existing.semester_label,
+            }
+            changed = False
+            for field, new_value in new_values.items():
+                if getattr(existing, field) != new_value:
+                    setattr(existing, field, new_value)
+                    changed = True
+            return existing.id, changed
+
+        new_note = Note(
+            eseo_id=eseo_id,
+            external_key=external_key,
+            ue_nom=ue.get("strNom"),
+            ue_code=ue.get("strCode"),
+            libelle=titre,
+            valeur=str(valeur) if valeur not in (None, "") else None,
+            coefficient=str(coefficient) if coefficient is not None else None,
+            semester_code=semester_code,
+            semester_label=semester_label,
+        )
+        db.add(new_note)
+        try:
+            db.flush()  # assign new_note.id without committing yet
+        except IntegrityError:
+            db.rollback()
+            print(f"Duplicate note skipped (race condition): {titre}")
+            return None
+
+        return new_note.id, True
+
+    except Exception as e:
+        print(f"Error upserting note: {e}")
+        return None
+
+
+async def upsert_notes(
+    db: Session,
+    eseo_id: int,
+    raw_notes: List[Dict],
+    semester_code: Optional[str] = None,
+    semester_label: Optional[str] = None,
+) -> int:
+    """
+    Sync a user's notes to the database for ONE semester: insert new
+    evaluations, update ones whose value/coefficient/title changed, and
+    delete evaluations that existed before but are no longer present
+    upstream. Mirrors upsert_events, but scoped to a semester rather than a
+    date range - notes aren't calendar-scoped like schedule events, but a
+    user's Note rows span every semester ESEO has a record for (see
+    database.Note.semester_code), so stale-deletion must stay within the
+    semester being upserted or it would delete every OTHER semester's rows.
+
+    Args:
+        raw_notes: list of UE objects as returned by the notes API, each
+            with a nested `Contenu` list of individual evaluations.
+        semester_code: which semester this raw_notes fetch is for. None only
+            for legacy call sites predating multi-semester support.
+    """
+    upserted_count = 0
+    touched_ids = set()
+
+    for ue in raw_notes:
+        for evaluation in (ue.get("Contenu") or []):
+            result = _upsert_single_note(db, eseo_id, ue, evaluation, semester_code, semester_label)
+            if result is None:
+                continue
+            note_id, changed = result
+            touched_ids.add(note_id)
+            if changed:
+                upserted_count += 1
+
+    db.commit()
+
+    scoped_query = db.query(Note).filter(Note.eseo_id == eseo_id, Note.semester_code == semester_code)
+
+    if not touched_ids:
+        # An empty upstream response, for a semester that already has notes
+        # on file, is far more likely a transient/parsing hiccup than every
+        # evaluation genuinely disappearing at once. Unlike upsert_events
+        # (bounded to the fetched date range, where "empty" plausibly means
+        # a real holiday week), skip stale-deletion here rather than wiping
+        # a semester's entire note history on a fluke - Note rows are meant
+        # to be a permanent record (see database.Note's docstring).
+        has_existing = scoped_query.first() is not None
+        if has_existing:
+            print(f"Notes fetch for user {eseo_id} (semester {semester_code}) returned no evaluations "
+                  f"while notes already existed - skipping stale-deletion as a precaution")
+            return upserted_count
+
+    stale_query = scoped_query
+    if touched_ids:
+        stale_query = stale_query.filter(~Note.id.in_(touched_ids))
+
+    deleted_count = stale_query.delete(synchronize_session=False)
+    if deleted_count:
+        db.commit()
+        print(f"Removed {deleted_count} stale note(s) for user {eseo_id}/semester {semester_code} "
+              f"(no longer present upstream)")
+
+    return upserted_count
+
+
 # Routes
 @app.get("/", response_model=HealthResponse)
 async def health_check():
@@ -536,8 +732,20 @@ async def health_check():
     )
 
 
-def _finalize_login(db: Session, eseo_id: str) -> LoginResponse:
-    """Create or update user and return JWT login response"""
+async def _finalize_login(
+    db: Session,
+    eseo_id: str,
+    notes_result: Optional[dict] = None,
+) -> LoginResponse:
+    """
+    Create or update user and return JWT login response.
+
+    notes_result is whatever ESEOScraper._capture_notes_session returned
+    during this login (see scraper.py) - on success it carries both the
+    user's initial notes snapshot and a session_state to cache for later
+    background checks. Best-effort: a missing/failed notes_result never
+    blocks login, it just means notes stay unavailable until next login.
+    """
     user = db.query(User).filter(User.eseo_id == int(eseo_id)).first()
 
     if not user:
@@ -548,7 +756,48 @@ def _finalize_login(db: Session, eseo_id: str) -> LoginResponse:
 
     user.last_sync = datetime.now(timezone.utc)
     user.updated_at = datetime.now(timezone.utc)
+
+    if notes_result and notes_result.get("status") == "ok" and notes_result.get("session_state"):
+        user.eseo_session_state_encrypted = encrypt_session_state(notes_result["session_state"])
+        user.notes_session_updated_at = datetime.now(timezone.utc)
+
     db.commit()
+
+    if notes_result and notes_result.get("status") == "ok":
+        try:
+            semesters = notes_result.get("semesters") or []
+            current = semesters[0] if semesters else None
+
+            if current:
+                # Only the current semester (semesters[0]) is ever
+                # diffed/notified on - the rest are cached read-only history
+                # for the semester picker (see the loop below).
+                old_hash = user.current_notes_hash
+                old_notes_map = _capture_pre_sync_notes_state(db, user.eseo_id, current["code"])
+                await upsert_notes(
+                    db, user.eseo_id, current["notes"], semester_code=current["code"],
+                    semester_label=current.get("label"),
+                )
+                new_hash = _notify_if_notes_changed(db, user, old_hash, old_notes_map, current["code"])
+                user.current_notes_hash = new_hash
+                user.current_semester_code = current["code"]
+                user.notes_last_sync = datetime.now(timezone.utc)
+
+            for semester in semesters[1:]:
+                if not semester.get("code"):
+                    continue
+                await upsert_notes(
+                    db, user.eseo_id, semester["notes"], semester_code=semester["code"],
+                    semester_label=semester.get("label"),
+                )
+
+            user.available_semesters_json = json.dumps([
+                {"code": s["code"], "label": s.get("label")} for s in semesters if s.get("code")
+            ])
+            db.commit()
+        except Exception as e:
+            print(f"Error populating initial notes snapshot for user {eseo_id}: {e}")
+            db.rollback()
 
     access_token = create_access_token(data={"eseo_id": int(eseo_id)})
 
@@ -592,7 +841,7 @@ async def login(credentials: LoginRequest, db: Session = Depends(get_db)):
         )
 
     # No MFA needed - direct login
-    return _finalize_login(db, result["eseo_id"])
+    return await _finalize_login(db, result["eseo_id"], notes_result=result.get("notes"))
 
 
 @app.post("/auth/mfa/verify", response_model=LoginResponse)
@@ -620,7 +869,7 @@ async def verify_mfa(request: MFAVerifyRequest, db: Session = Depends(get_db)):
             detail="Invalid or expired verification code."
         )
 
-    return _finalize_login(db, result["eseo_id"])
+    return await _finalize_login(db, result["eseo_id"], notes_result=result.get("notes"))
 
 
 @app.post("/auth/register-device")
@@ -871,6 +1120,131 @@ async def get_schedule_changes(
         )
         for change in changes
     ]
+
+
+@app.get("/notes", response_model=NotesResponse)
+async def get_notes(
+    force: bool = Query(False, description="Force refresh from ESEO (current semester only)"),
+    semester_code: Optional[str] = Query(
+        None, description="Which semester to fetch (see GET /notes/semesters). Defaults to the current one."
+    ),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
+    """
+    Get user's notes with cache-first strategy, mirrors /agenda.
+
+    Unlike the schedule, notes require a live ESEO session (see
+    scheduler.sync_user_notes) - session_valid tells the client whether that
+    session exists, so it can show a "reconnect to refresh notes" hint
+    without ever treating this as a hard error.
+
+    A user's Note rows span every semester ESEO has a record for (see
+    database.Note.semester_code) - this always returns exactly one semester's
+    worth, defaulting to the current one. Only the current semester supports
+    a live refresh (force=true) or gets a background sync scheduled -
+    historical semesters are read-only, populated at login only (see
+    _finalize_login) since finalized grades don't change.
+
+    Query params:
+        - semester_code: defaults to the user's current semester
+        - force: Force a live refresh from ESEO (default: false) - ignored
+          for a semester_code other than the current one
+    """
+    target_code = semester_code or current_user.current_semester_code
+    is_current = target_code == current_user.current_semester_code
+    session_valid = bool(current_user.eseo_session_state_encrypted)
+
+    if force and is_current and session_valid:
+        await sync_user_notes(current_user.eseo_id, force=True)
+        db.refresh(current_user)
+        session_valid = bool(current_user.eseo_session_state_encrypted)
+        target_code = current_user.current_semester_code
+    elif is_current and session_valid:
+        background_tasks.add_task(maybe_sync_and_notify_notes, current_user.eseo_id)
+
+    notes = db.query(Note).filter(
+        Note.eseo_id == current_user.eseo_id, Note.semester_code == target_code
+    ).all()
+
+    return NotesResponse(
+        notes=[note_to_dict(n) for n in notes],
+        source="api" if (force and is_current and session_valid) else "cache",
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+        session_valid=session_valid,
+    )
+
+
+@app.get("/notes/semesters")
+async def get_note_semesters(current_user: User = Depends(get_current_user)):
+    """
+    List every semester/year available for this user (code + label), for the
+    app's semester picker. Populated at login (see _finalize_login); empty
+    until the user's first successful login under this feature.
+    """
+    try:
+        semesters = json.loads(current_user.available_semesters_json) if current_user.available_semesters_json else []
+    except (json.JSONDecodeError, TypeError):
+        semesters = []
+
+    return {
+        "semesters": semesters,
+        "current_semester_code": current_user.current_semester_code,
+    }
+
+
+@app.get("/notes/bulletin", response_model=BulletinResponse)
+async def get_bulletin(
+    semester_code: Optional[str] = Query(None, description="Defaults to the current semester"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Fetches and parses the "Bulletin provisoire" (official printable
+    average/ECTS/grade summary per UE - see utils.parse_bulletin_html) for
+    one semester. Always a live fetch - unlike /notes, there's no caching:
+    this is an on-demand action the user takes occasionally (opening a
+    dedicated bulletin screen), not something checked in the background, so
+    there's no reason to pre-crawl or persist it.
+    """
+    if not current_user.eseo_session_state_encrypted:
+        return BulletinResponse(status="unavailable")
+
+    session_state = decrypt_session_state(current_user.eseo_session_state_encrypted)
+    if session_state is None:
+        return BulletinResponse(status="unavailable")
+
+    target_code = semester_code or current_user.current_semester_code
+    semester_label = None
+    if target_code and target_code != current_user.current_semester_code:
+        try:
+            semesters = json.loads(current_user.available_semesters_json) if current_user.available_semesters_json else []
+            semester_label = next((s.get("label") for s in semesters if s.get("code") == target_code), None)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    result = await ESEOScraper.fetch_bulletin_async(session_state, semester_label=semester_label)
+
+    if result["status"] == "session_expired":
+        current_user.eseo_session_state_encrypted = None
+        current_user.notes_session_updated_at = None
+        db.commit()
+        return BulletinResponse(status="unavailable")
+
+    if result["status"] != "ok":
+        print(f"Failed to fetch bulletin for user {current_user.eseo_id}: {result.get('detail')}")
+        return BulletinResponse(status="unavailable")
+
+    parsed = parse_bulletin_html(result["html"])
+    return BulletinResponse(
+        status="ok",
+        student_name=parsed["student_name"],
+        title=parsed["title"],
+        ues=parsed["ues"],
+        synthese=parsed["synthese"],
+        html=result["html"],
+    )
 
 
 # Application lifecycle events

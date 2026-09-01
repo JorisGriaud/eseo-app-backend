@@ -15,9 +15,10 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 import sync_coordination
-from database import SessionLocal, User, Event, ScheduleChange
+from database import SessionLocal, User, Event, ScheduleChange, Note, NoteChange
 from scraper import ESEOScraper
-from utils import PARIS_TZ, calculate_schedule_hash_for_range
+from security import encrypt_session_state, decrypt_session_state
+from utils import PARIS_TZ, calculate_schedule_hash_for_range, calculate_notes_hash
 
 # Global scheduler instance
 scheduler = BackgroundScheduler()
@@ -81,7 +82,15 @@ def send_firebase_notification(device_token: str, title: str, body: str, data: d
                 priority='high',
                 notification=messaging.AndroidNotification(
                     sound='default',
-                    click_action='FLUTTER_NOTIFICATION_CLICK',
+                    # No click_action: 'FLUTTER_NOTIFICATION_CLICK' has no
+                    # matching intent-filter in AndroidManifest.xml (only the
+                    # default MAIN/LAUNCHER one), so Android silently fails to
+                    # resolve which activity to launch on tap - a background/
+                    # killed-app notification tap does nothing at all. Omitting
+                    # click_action lets FCM fall back to its default behavior
+                    # (launch the app's own launcher activity), which is what
+                    # notification_service.dart's onMessageOpenedApp/
+                    # getInitialMessage handlers are already built to expect.
                 ),
             ),
             # iOS-specific options
@@ -329,6 +338,7 @@ def _persist_and_notify_changes(
                 title,
                 body,
                 data={
+                    "kind": "schedule",
                     "change_type": change_type,
                     "target_date": _to_paris(debut).date().isoformat(),
                     "event_id": str(event_id) if event_id else "",
@@ -561,10 +571,329 @@ def sync_all_users():
         db.close()
 
 
+def _capture_pre_sync_notes_state(db, eseo_id: int, semester_code: Optional[str]) -> dict:
+    """
+    Snapshot a user's current Note rows for ONE semester, keyed by
+    external_key (ESEO's own stable "intIdEvaluation" id). Used both before a
+    fetch (the "old" state for diffing) and after upserting (the "current"
+    state) - it's a pure query, so the same function works for both.
+
+    Unlike _capture_pre_sync_state (schedule), there's no date range: notes
+    aren't calendar-scoped. Must be scoped by semester_code instead - a
+    user's Note rows span every semester ESEO has a record for (see
+    database.Note.semester_code), and only the current semester is ever
+    diffed/notified on.
+    """
+    notes = db.query(Note).filter(Note.eseo_id == eseo_id, Note.semester_code == semester_code).all()
+    return {
+        n.external_key: {"libelle": n.libelle, "valeur": n.valeur, "coefficient": n.coefficient}
+        for n in notes
+    }
+
+
+def _diff_notes(old_map: dict, new_map: dict) -> List[dict]:
+    """
+    Diff two {external_key: {libelle, valeur, coefficient}} snapshots into a
+    list of individual changes, mirroring _diff_events's set-union approach.
+
+    Named "add"/"update"/"remove" rather than schedule's "add"/"cancel"/
+    "replace": a grade never "moves" the way an event can, and "update" (a
+    value changing) is a more accurate name than "replace" for a correction.
+
+    ESEO creates an evaluation's row (title/coefficient) before it's graded -
+    strValeur starts as "". So the common case of "a grade just came out" is,
+    at the DB row level, an *update* to an already-existing Note (valeur:
+    None -> "15.5"), not a brand new row. To the user that reads as "a new
+    grade", not "a changed grade" - so that specific transition (empty/None
+    -> a real value) is classified as "add", with old=None, same as a
+    genuinely new evaluation appearing.
+    """
+    changes = []
+    for key in set(old_map) | set(new_map):
+        old = old_map.get(key)
+        new = new_map.get(key)
+
+        if old and new:
+            if old == new:
+                continue
+            if not old.get("valeur") and new.get("valeur"):
+                changes.append({"type": "add", "external_key": key, "old": None, "new": new})
+            else:
+                changes.append({"type": "update", "external_key": key, "old": old, "new": new})
+        elif new and not old:
+            changes.append({"type": "add", "external_key": key, "old": None, "new": new})
+        elif old and not new:
+            changes.append({"type": "remove", "external_key": key, "old": old, "new": None})
+
+    changes.sort(key=lambda c: c["external_key"])
+    return changes
+
+
+def _format_note_notification(change_type: str, old: Optional[dict], new: Optional[dict]) -> tuple:
+    """Builds (title, body) for a single note change's push notification."""
+    libelle = (new or old)["libelle"] or "Evaluation"
+
+    if change_type == "add":
+        return ("Nouvelle note disponible", f"{libelle} : {new['valeur'] or '?'}")
+
+    if change_type == "remove":
+        return ("Note retirée", f"{libelle} a été retirée")
+
+    # update
+    return ("Note modifiée", f"{libelle} : {old['valeur'] or '?'} → {new['valeur'] or '?'}")
+
+
+def _persist_and_notify_note_changes(db, user: User, changes: List[dict], is_first_sync: bool) -> None:
+    """
+    Persists each change as a NoteChange row (powers a future history view
+    and the audit trail) and sends one push notification per change - except
+    on a user's very first-ever notes sync, where nothing is pushed (that's
+    just the initial population of their notes, not "new" grades appearing).
+    This mirrors _persist_and_notify_changes's previously_known_range
+    suppression, simplified to a single boolean since notes have no date
+    range to be "previously known" within.
+    """
+    for change in changes:
+        change_type = change["type"]
+        old = change["old"]
+        new = change["new"]
+        external_key = change["external_key"]
+
+        note_id = None
+        if new:
+            note_row = db.query(Note).filter(
+                Note.eseo_id == user.eseo_id,
+                Note.external_key == external_key,
+            ).first()
+            note_id = note_row.id if note_row else None
+
+        db.add(NoteChange(
+            eseo_id=user.eseo_id,
+            change_type=change_type,
+            note_id=note_id,
+            external_key=external_key,
+            libelle=(new or old)["libelle"],
+            old_valeur=old["valeur"] if old else None,
+            new_valeur=new["valeur"] if new else None,
+        ))
+
+        if not is_first_sync and user.device_token:
+            title, body = _format_note_notification(change_type, old, new)
+            send_firebase_notification(
+                user.device_token,
+                title,
+                body,
+                data={
+                    "kind": "note",
+                    "change_type": change_type,
+                    "note_id": str(note_id) if note_id else "",
+                    "libelle": (new or old)["libelle"] or "",
+                    "old_valeur": (old["valeur"] or "") if old else "",
+                    "new_valeur": (new["valeur"] or "") if new else "",
+                },
+            )
+
+    db.commit()
+
+
+def _notify_if_notes_changed(
+    db, user: User, old_hash: Optional[str], old_notes_map: dict, semester_code: Optional[str]
+) -> str:
+    """
+    Compares the user's current DB state for ONE semester to a pre-sync
+    snapshot, and if it changed, diffs it (see _diff_notes) and
+    persists+notifies each change (see _persist_and_notify_note_changes).
+    Returns the new hash so the caller can persist it on
+    User.current_notes_hash.
+
+    old_hash is None exactly when the user has never had a notes snapshot
+    before - i.e. this is their first-ever notes sync - the signal used to
+    suppress notifications for what would otherwise look like a flood of
+    "new" grades. Only ever called for the user's current semester - other
+    semesters are read-only historical data, never diffed/notified.
+    """
+    new_hash = calculate_notes_hash(db, user.eseo_id, semester_code)
+
+    if new_hash != old_hash:
+        print(f"Notes changed for user {user.eseo_id}")
+        current_notes_map = _capture_pre_sync_notes_state(db, user.eseo_id, semester_code)
+        changes = _diff_notes(old_notes_map, current_notes_map)
+        if changes:
+            _persist_and_notify_note_changes(db, user, changes, is_first_sync=(old_hash is None))
+
+    return new_hash
+
+
+async def sync_user_notes(eseo_id: int, debounce_seconds: float = 0, force: bool = False) -> bool:
+    """
+    Core notes sync for one user: debounce check -> decrypt the cached ESEO
+    session -> fetch notes by reusing that session in a headless browser
+    (see ESEOScraper.fetch_notes_async) -> upsert -> diff & notify -> mark
+    checked -> update notes_last_sync.
+
+    No groupe fan-out here (unlike sync_user_schedule) - notes are entirely
+    personal, never shared between users.
+
+    Returns:
+        True if a sync actually ran, False if skipped (no cached session,
+        debounce, or failure) - the last two are silent/expected, not errors.
+    """
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.eseo_id == eseo_id).first()
+        if not user or not user.eseo_session_state_encrypted:
+            return False
+
+        notes_key = sync_coordination.notes_user_key(eseo_id)
+        if not force and not sync_coordination.should_sync(notes_key, [], debounce_seconds):
+            return False
+
+        # Claim this sync slot immediately, BEFORE the slow browser-based
+        # fetch below (multi-second: browser launch + page nav + SSO
+        # redirect), not after. Two /notes requests arriving close together
+        # (e.g. app init + resume) would otherwise both pass the should_sync
+        # check above while neither has finished yet, both independently
+        # fetch+diff+notify the same underlying change, and the user gets a
+        # duplicate push for one real change - confirmed live during testing.
+        sync_coordination.mark_checked(notes_key, [])
+
+        session_state = decrypt_session_state(user.eseo_session_state_encrypted)
+        if session_state is None:
+            print(f"Could not decrypt stored notes session for user {eseo_id}, clearing it")
+            user.eseo_session_state_encrypted = None
+            user.notes_session_updated_at = None
+            db.commit()
+            return False
+
+        # The current semester's code is stable across syncs (a student stays
+        # in the same semester for months) - captured at login (see
+        # main._finalize_login) and reused here to scope the "before" state.
+        # If it ever turns out to have changed (semester rollover), the
+        # fetch below reveals the new code and this sync just adopts it.
+        semester_code = user.current_semester_code
+
+        old_hash = user.current_notes_hash
+        old_notes_map = _capture_pre_sync_notes_state(db, eseo_id, semester_code)
+
+        result = await ESEOScraper.fetch_notes_async(session_state)
+
+        if result["status"] == "session_expired":
+            print(f"Notes session expired for user {eseo_id}, clearing it")
+            user.eseo_session_state_encrypted = None
+            user.notes_session_updated_at = None
+            db.commit()
+            return False
+
+        if result["status"] != "ok":
+            print(f"Failed to fetch notes for user {eseo_id}: {result.get('detail')}")
+            return False
+
+        new_code = result.get("code") or semester_code
+
+        # Lazy import: main.py imports sync_user_notes from this module at
+        # load time, so importing main.py back at module level here would be
+        # circular (same pattern as sync_user_schedule's import of main.upsert_events).
+        from main import upsert_notes
+
+        await upsert_notes(db, eseo_id, result["notes"], semester_code=new_code)
+
+        if new_code != semester_code:
+            # Semester rollover mid-cycle: the "before" snapshot above was
+            # scoped to the old code (and is therefore empty for the new
+            # one), so this sync will look like a first-ever sync for the
+            # new semester - correctly suppressing notifications for what's
+            # really just routine population of a newly-active semester.
+            old_hash = None
+            old_notes_map = {}
+            user.current_semester_code = new_code
+
+        new_hash = _notify_if_notes_changed(db, user, old_hash, old_notes_map, new_code)
+        user.current_notes_hash = new_hash
+
+        # MSAL may rotate tokens/cookies on use - persisting the refreshed
+        # state extends how long this cached session stays usable.
+        if result.get("session_state"):
+            user.eseo_session_state_encrypted = encrypt_session_state(result["session_state"])
+            user.notes_session_updated_at = datetime.now(timezone.utc)
+
+        user.notes_last_sync = datetime.now(timezone.utc)
+        db.commit()
+
+        return True
+
+    except Exception as e:
+        print(f"Error syncing notes for user {eseo_id}: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+async def maybe_sync_and_notify_notes(eseo_id: int) -> None:
+    """
+    App-driven notes sync trigger, mirrors maybe_sync_and_notify - called as
+    a FastAPI BackgroundTask from /notes on every call, so it never blocks
+    the response. Debounced to 3h: notes change far less often than a
+    schedule, and each check spins up a real headless browser (heavier than
+    the schedule's plain HTTP call), so there's little value in checking as
+    aggressively as the 5-minute schedule debounce.
+
+    Must never raise - it runs after the HTTP response has already been sent.
+    """
+    try:
+        await sync_user_notes(eseo_id, debounce_seconds=10800)
+    except Exception as e:
+        print(f"Error in background notes sync for user {eseo_id}: {e}")
+
+
+def sync_all_notes():
+    """
+    Safety-net notes sync, called 3 times a day (8h, 14h, 20h) - only for
+    users with a cached session (no session = nothing to check until their
+    next login). Much less frequent than sync_all_users's 3-hour cadence:
+    grades change far less often than a timetable, and the session this
+    relies on is a more fragile mechanism than the schedule's public API, so
+    there's no reason to poll it as aggressively.
+    """
+    print(f"[{datetime.now().isoformat()}] Starting notes sync for all eligible users")
+
+    db = SessionLocal()
+    try:
+        users = db.query(User).filter(User.eseo_session_state_encrypted.isnot(None)).all()
+        total_users = len(users)
+
+        if total_users == 0:
+            print("No users with a cached notes session")
+            return
+
+        print(f"Checking notes for {total_users} users")
+
+        synced_count = 0
+        skipped_count = 0
+
+        for index, user in enumerate(users, 1):
+            did_sync = asyncio.run(sync_user_notes(user.eseo_id, debounce_seconds=10800))
+
+            if did_sync:
+                synced_count += 1
+            else:
+                skipped_count += 1
+
+            if index < total_users:
+                time.sleep(2)
+
+        print(f"Notes sync completed: {synced_count} synced, {skipped_count} skipped")
+
+    except Exception as e:
+        print(f"Error in sync_all_notes: {e}")
+    finally:
+        db.close()
+
+
 def purge_old_events():
     """
-    Purge events older than 6 months, and logged schedule changes older than
-    90 days, to prevent DB bloat. Runs once per day at 2 AM.
+    Purge events older than 6 months, and logged schedule/note changes older
+    than 90 days, to prevent DB bloat. Runs once per day at 2 AM.
     """
     print(f"[{datetime.now().isoformat()}] Starting old events purge...")
 
@@ -575,11 +904,13 @@ def purge_old_events():
 
         changes_cutoff = datetime.now(timezone.utc) - timedelta(days=90)
         deleted_changes = db.query(ScheduleChange).filter(ScheduleChange.created_at < changes_cutoff).delete()
+        deleted_note_changes = db.query(NoteChange).filter(NoteChange.created_at < changes_cutoff).delete()
 
         db.commit()
 
-        print(f"Purged {deleted} events older than {cutoff_date.date()} "
-              f"and {deleted_changes} logged changes older than {changes_cutoff.date()}")
+        print(f"Purged {deleted} events older than {cutoff_date.date()}, "
+              f"{deleted_changes} logged schedule changes and {deleted_note_changes} "
+              f"logged note changes older than {changes_cutoff.date()}")
 
     except Exception as e:
         print(f"Error purging old events: {e}")
@@ -610,6 +941,16 @@ def start_scheduler():
         replace_existing=True
     )
 
+    # Notes change far less often than a schedule, and each check is a real
+    # headless browser page load (see sync_all_notes) - 3x/day is plenty.
+    scheduler.add_job(
+        func=sync_all_notes,
+        trigger=CronTrigger(hour="8,14,20", minute=0),
+        id="notes_sync",
+        name="Synchronize all users' notes (safety net)",
+        replace_existing=True
+    )
+
     # Schedule purge job to run daily at 2 AM
     scheduler.add_job(
         func=purge_old_events,
@@ -620,7 +961,7 @@ def start_scheduler():
     )
 
     scheduler.start()
-    print("Scheduler started: Sync every 3h 7AM-7PM (safety net), Purge daily 2AM")
+    print("Scheduler started: Schedule sync every 3h 7AM-7PM, Notes sync 8h/14h/20h, Purge daily 2AM")
 
 
 def stop_scheduler():

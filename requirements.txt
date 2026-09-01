@@ -4,6 +4,7 @@ annotated-types==0.8.0
 anyio==4.14.2
 APScheduler==3.11.3
 bcrypt==5.0.0
+beautifulsoup4==4.15.0
 blinker==1.9.0
 CacheControl==0.14.4
 certifi==2026.7.22
@@ -70,6 +71,7 @@ rignore==0.8.1
 rsa==4.9.1
 sentry-sdk==2.68.1
 shellingham==1.5.4
+soupsieve==2.9.2
 SQLAlchemy==2.0.52
 starlette==1.6.0
 typer==0.27.2

@@ -23,6 +23,15 @@ def user_key(eseo_id: int) -> str:
     return f"user:{eseo_id}"
 
 
+def notes_user_key(eseo_id: int) -> str:
+    """
+    Debounce key for a user's notes checks - a separate namespace from
+    user_key() so a schedule check and a notes check don't reset each
+    other's timers (they run on very different cadences).
+    """
+    return f"notes:{eseo_id}"
+
+
 def _is_stale(key: str, within_seconds: float) -> bool:
     last = _last_checked.get(key)
     if last is None:
