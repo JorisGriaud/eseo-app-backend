@@ -9,10 +9,10 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Europe/Paris
-      - URL=votredomaine.com
+      - URL=${DOMAIN}
       - SUBDOMAINS=edt-api
       - VALIDATION=http
-      - EMAIL=votre@email.com
+      - EMAIL=${EMAIL}
       - ONLY_SUBDOMAINS=false
       - STAGING=false
     volumes:
@@ -33,11 +33,16 @@ services:
     environment:
       - TZ=Europe/Paris
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - COOKIE_ENCRYPTION_KEY=${COOKIE_ENCRYPTION_KEY}
       - DATABASE_URL=sqlite:///./data/edt.db
       - PYTHONUNBUFFERED=1
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
     volumes:
       # Mount only data directory (not source code for production)
       - edt-data:/app/data
+      # Firebase Admin SDK service-account key (see credentials/README.md) -
+      # read-only, mounted at the default FIREBASE_CREDENTIALS_PATH.
+      - ./credentials:/app/credentials:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/', timeout=5)"]
       interval: 30s
