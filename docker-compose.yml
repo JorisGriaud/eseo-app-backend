@@ -1,30 +1,4 @@
 services:
-  # SWAG - Reverse proxy avec Let's Encrypt
-  swag:
-    image: lscr.io/linuxserver/swag:latest
-    container_name: swag
-    cap_add:
-      - NET_ADMIN
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Europe/Paris
-      - URL=${DOMAIN}
-      - SUBDOMAINS=edt-api
-      - VALIDATION=http
-      - EMAIL=${EMAIL}
-      - ONLY_SUBDOMAINS=false
-      - STAGING=false
-    volumes:
-      - ./swag/config:/config
-      - ./edt-api.subdomain.conf:/config/nginx/proxy-confs/edt-api.subdomain.conf:ro
-    ports:
-      - 443:443
-      - 80:80
-    restart: unless-stopped
-    networks:
-      - edt-network
-
   eseo-app-backend:
     build:
       context: .
@@ -50,14 +24,11 @@ services:
       retries: 3
       start_period: 40s
     ports:
+      # Published on the host so SWAG - running on a separate machine, see
+      # edt-api.subdomain.conf - can reach it over the LAN. Not on the same
+      # Docker network/host as SWAG, so no service-name DNS resolution here.
       - 9080:8000
-    networks:
-      - edt-network
     restart: unless-stopped
-
-networks:
-  edt-network:
-    driver: bridge
 
 volumes:
   edt-data:
