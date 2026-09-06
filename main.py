@@ -26,11 +26,10 @@ from scheduler import (
     stop_scheduler,
     maybe_sync_and_notify,
     maybe_sync_and_notify_notes,
+    populate_notes_after_login,
     sync_user_notes,
     _capture_pre_sync_state,
     _notify_if_changed,
-    _capture_pre_sync_notes_state,
-    _notify_if_notes_changed,
 )
 from utils import (
     PARIS_TZ, parse_eseo_datetime, format_datetime_for_response, calculate_schedule_hash_for_range,
@@ -736,15 +735,20 @@ async def _finalize_login(
     db: Session,
     eseo_id: str,
     notes_result: Optional[dict] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> LoginResponse:
     """
     Create or update user and return JWT login response.
 
     notes_result is whatever ESEOScraper._capture_notes_session returned
-    during this login (see scraper.py) - on success it carries both the
-    user's initial notes snapshot and a session_state to cache for later
-    background checks. Best-effort: a missing/failed notes_result never
-    blocks login, it just means notes stay unavailable until next login.
+    during this login (see scraper.py): just the captured ESEO session, which
+    is cheap to grab. The actual notes population (fetch + 9-semester crawl)
+    is scheduled as a background task instead of running here - inline it
+    pushed the login request past a minute and the app timed out before the
+    backend finished, making every login look like a failure.
+
+    Best-effort: a missing/failed notes_result never blocks login, it just
+    means notes stay unavailable until the next login.
     """
     user = db.query(User).filter(User.eseo_id == int(eseo_id)).first()
 
@@ -757,47 +761,17 @@ async def _finalize_login(
     user.last_sync = datetime.now(timezone.utc)
     user.updated_at = datetime.now(timezone.utc)
 
-    if notes_result and notes_result.get("status") == "ok" and notes_result.get("session_state"):
+    captured_session = bool(
+        notes_result and notes_result.get("status") == "ok" and notes_result.get("session_state")
+    )
+    if captured_session:
         user.eseo_session_state_encrypted = encrypt_session_state(notes_result["session_state"])
         user.notes_session_updated_at = datetime.now(timezone.utc)
 
     db.commit()
 
-    if notes_result and notes_result.get("status") == "ok":
-        try:
-            semesters = notes_result.get("semesters") or []
-            current = semesters[0] if semesters else None
-
-            if current:
-                # Only the current semester (semesters[0]) is ever
-                # diffed/notified on - the rest are cached read-only history
-                # for the semester picker (see the loop below).
-                old_hash = user.current_notes_hash
-                old_notes_map = _capture_pre_sync_notes_state(db, user.eseo_id, current["code"])
-                await upsert_notes(
-                    db, user.eseo_id, current["notes"], semester_code=current["code"],
-                    semester_label=current.get("label"),
-                )
-                new_hash = _notify_if_notes_changed(db, user, old_hash, old_notes_map, current["code"])
-                user.current_notes_hash = new_hash
-                user.current_semester_code = current["code"]
-                user.notes_last_sync = datetime.now(timezone.utc)
-
-            for semester in semesters[1:]:
-                if not semester.get("code"):
-                    continue
-                await upsert_notes(
-                    db, user.eseo_id, semester["notes"], semester_code=semester["code"],
-                    semester_label=semester.get("label"),
-                )
-
-            user.available_semesters_json = json.dumps([
-                {"code": s["code"], "label": s.get("label")} for s in semesters if s.get("code")
-            ])
-            db.commit()
-        except Exception as e:
-            print(f"Error populating initial notes snapshot for user {eseo_id}: {e}")
-            db.rollback()
+    if captured_session and background_tasks is not None:
+        background_tasks.add_task(populate_notes_after_login, int(eseo_id))
 
     access_token = create_access_token(data={"eseo_id": int(eseo_id)})
 
@@ -808,7 +782,11 @@ async def _finalize_login(
 
 
 @app.post("/auth/login", response_model=LoginResponse)
-async def login(credentials: LoginRequest, db: Session = Depends(get_db)):
+async def login(
+    credentials: LoginRequest,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
     """
     Authenticate user with ESEO credentials.
 
@@ -841,11 +819,17 @@ async def login(credentials: LoginRequest, db: Session = Depends(get_db)):
         )
 
     # No MFA needed - direct login
-    return await _finalize_login(db, result["eseo_id"], notes_result=result.get("notes"))
+    return await _finalize_login(
+        db, result["eseo_id"], notes_result=result.get("notes"), background_tasks=background_tasks
+    )
 
 
 @app.post("/auth/mfa/verify", response_model=LoginResponse)
-async def verify_mfa(request: MFAVerifyRequest, db: Session = Depends(get_db)):
+async def verify_mfa(
+    request: MFAVerifyRequest,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
     """
     Complete MFA verification and return JWT token.
 
@@ -869,7 +853,9 @@ async def verify_mfa(request: MFAVerifyRequest, db: Session = Depends(get_db)):
             detail="Invalid or expired verification code."
         )
 
-    return await _finalize_login(db, result["eseo_id"], notes_result=result.get("notes"))
+    return await _finalize_login(
+        db, result["eseo_id"], notes_result=result.get("notes"), background_tasks=background_tasks
+    )
 
 
 @app.post("/auth/register-device")

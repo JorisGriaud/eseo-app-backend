@@ -295,22 +295,57 @@ class ESEOScraper:
     async def _capture_notes_session(page) -> dict:
         """
         Called right after a successful login/MFA, while the browser is
-        still open. Fetches the user's full notes snapshot across every
-        semester AND captures storage_state for later background reuse, in
-        one round trip. Never raises - a failure here must not break login;
-        it just means notes stay unavailable for this user until their next
-        login.
+        still open: snapshots storage_state (cookies + the MSAL token cache
+        in localStorage) so notes can be fetched later without another
+        login/MFA.
 
-        Returns the same shape as _fetch_all_semesters_from_page, plus
+        Deliberately does NOTHING else - no navigation, no notes fetch, no
+        semester crawl. All of that runs afterwards in a background task
+        (see scheduler.populate_notes_after_login), because it took well over
+        a minute and the login request would time out client-side long before
+        finishing. Never raises: a failure here just means notes stay
+        unavailable until the next login.
+
+        Returns {"status": "ok", "session_state": "..."} or
+        {"status": "error", "detail": "..."}.
+        """
+        try:
+            return {"status": "ok", "session_state": json.dumps(await page.context.storage_state())}
+        except Exception as e:
+            print(f"Failed to capture notes session state: {e}")
+            return {"status": "error", "detail": str(e)}
+
+    @staticmethod
+    async def fetch_all_semesters_async(session_state_json: str) -> dict:
+        """
+        Full multi-semester notes crawl using a previously stored session -
+        the background counterpart to _fetch_all_semesters_from_page, run
+        after login has already responded (see
+        scheduler.populate_notes_after_login) rather than inside it.
+
+        Same return shape as _fetch_all_semesters_from_page, plus a refreshed
         "session_state" on success.
         """
-        result = await ESEOScraper._fetch_all_semesters_from_page(page)
-        if result["status"] == "ok":
-            try:
-                result["session_state"] = json.dumps(await page.context.storage_state())
-            except Exception as e:
-                print(f"Failed to capture notes session state: {e}")
-        return result
+        try:
+            storage_state = json.loads(session_state_json)
+        except Exception as e:
+            return {"status": "error", "detail": f"corrupt session_state: {e}"}
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+        try:
+            context = await browser.new_context(storage_state=storage_state)
+            page = await context.new_page()
+            result = await ESEOScraper._fetch_all_semesters_from_page(page)
+            if result["status"] == "ok":
+                try:
+                    result["session_state"] = json.dumps(await context.storage_state())
+                except Exception as e:
+                    print(f"Failed to refresh notes session state: {e}")
+            return result
+        finally:
+            await browser.close()
+            await p.stop()
 
     @staticmethod
     async def fetch_notes_async(session_state_json: str) -> dict:

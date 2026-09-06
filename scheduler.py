@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta, date
 from typing import Dict, List, Optional
 import time
 import asyncio
+import json
 import os
 
 # Firebase Admin SDK
@@ -844,6 +845,91 @@ async def maybe_sync_and_notify_notes(eseo_id: int) -> None:
         await sync_user_notes(eseo_id, debounce_seconds=10800)
     except Exception as e:
         print(f"Error in background notes sync for user {eseo_id}: {e}")
+
+
+async def populate_notes_after_login(eseo_id: int) -> None:
+    """
+    Full multi-semester notes population, run as a FastAPI BackgroundTask
+    right after login has responded (see main._finalize_login).
+
+    This used to happen inline during /auth/mfa/verify, which made that
+    request take well over a minute (page load + 9 semesters clicked through
+    one by one) - far past the app's client-side timeout, so every login
+    appeared to fail even though the backend eventually succeeded. Doing it
+    here keeps login as fast as it was before the semester picker existed.
+
+    Notifications stay suppressed for a user's first-ever sync (old_hash is
+    None), so this never pushes a flood of "new grade" alerts on signup.
+
+    Must never raise - it runs after the HTTP response has already been sent.
+    """
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.eseo_id == eseo_id).first()
+        if not user or not user.eseo_session_state_encrypted:
+            return
+
+        session_state = decrypt_session_state(user.eseo_session_state_encrypted)
+        if session_state is None:
+            return
+
+        result = await ESEOScraper.fetch_all_semesters_async(session_state)
+
+        if result["status"] == "session_expired":
+            print(f"Notes session expired right after login for user {eseo_id}, clearing it")
+            user.eseo_session_state_encrypted = None
+            user.notes_session_updated_at = None
+            db.commit()
+            return
+
+        if result["status"] != "ok":
+            print(f"Failed to populate notes after login for user {eseo_id}: {result.get('detail')}")
+            return
+
+        # Lazy import: main.py imports from this module at load time (see
+        # sync_user_notes for the same pattern).
+        from main import upsert_notes
+
+        semesters = result.get("semesters") or []
+        current = semesters[0] if semesters else None
+
+        if current:
+            old_hash = user.current_notes_hash
+            old_notes_map = _capture_pre_sync_notes_state(db, eseo_id, current["code"])
+            await upsert_notes(
+                db, eseo_id, current["notes"], semester_code=current["code"],
+                semester_label=current.get("label"),
+            )
+            user.current_notes_hash = _notify_if_notes_changed(
+                db, user, old_hash, old_notes_map, current["code"]
+            )
+            user.current_semester_code = current["code"]
+            user.notes_last_sync = datetime.now(timezone.utc)
+
+        for semester in semesters[1:]:
+            if not semester.get("code"):
+                continue
+            await upsert_notes(
+                db, eseo_id, semester["notes"], semester_code=semester["code"],
+                semester_label=semester.get("label"),
+            )
+
+        user.available_semesters_json = json.dumps([
+            {"code": s["code"], "label": s.get("label")} for s in semesters if s.get("code")
+        ])
+
+        if result.get("session_state"):
+            user.eseo_session_state_encrypted = encrypt_session_state(result["session_state"])
+            user.notes_session_updated_at = datetime.now(timezone.utc)
+
+        db.commit()
+        print(f"Notes populated after login for user {eseo_id}: {len(semesters)} semester(s)")
+
+    except Exception as e:
+        print(f"Error populating notes after login for user {eseo_id}: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 
 def sync_all_notes():
