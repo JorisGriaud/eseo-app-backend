@@ -16,6 +16,16 @@ import httpx
 from utils import get_date_range, filter_event_fields
 
 
+# Chromium launch flags shared by every browser we start.
+#
+# --disable-dev-shm-usage is required in Docker: the default /dev/shm is only
+# 64 MB there, which Chromium exhausts on JS-heavy pages (Microsoft's SSO
+# flow) - the renderer then hangs or dies and every wait_for_selector times
+# out. This flag makes Chromium use /tmp instead. Symptom without it: login
+# reaches the MFA challenge, then /auth/mfa/verify always times out, while
+# the exact same code works fine outside a container.
+CHROMIUM_ARGS = ["--disable-dev-shm-usage"]
+
 # MFA session management (async Playwright objects)
 _mfa_sessions: Dict[str, "MFASession"] = {}
 MFA_SESSION_TIMEOUT = 120  # seconds
@@ -87,7 +97,7 @@ class ESEOScraper:
         Extract ESEO ID from SharePoint using Microsoft authentication (async)
         """
         p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
         page = await browser.new_page()
 
         try:
@@ -319,7 +329,7 @@ class ESEOScraper:
             return {"status": "error", "detail": f"corrupt session_state: {e}"}
 
         p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
         try:
             context = await browser.new_context(storage_state=storage_state)
             page = await context.new_page()
@@ -359,7 +369,7 @@ class ESEOScraper:
             return {"status": "error", "detail": f"corrupt session_state: {e}"}
 
         p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
         page = None
         try:
             context = await browser.new_context(storage_state=storage_state)
@@ -420,7 +430,7 @@ class ESEOScraper:
         await _cleanup_expired_mfa_sessions()
 
         p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
         page = await browser.new_page()
         mfa_session_created = False
 

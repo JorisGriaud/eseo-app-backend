@@ -4,6 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: eseo-app-backend
+    # Chromium (Playwright) needs far more shared memory than Docker's 64 MB
+    # default - see CHROMIUM_ARGS in scraper.py. The --disable-dev-shm-usage
+    # flag already covers this; this is the belt-and-braces half.
+    shm_size: '1gb'
     environment:
       - TZ=Europe/Paris
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
@@ -25,7 +29,7 @@ services:
       start_period: 40s
     ports:
       # Published on the host so SWAG - running on a separate machine, see
-      # edt-api.subdomain.conf - can reach it over the LAN. Not on the same
+      # eseo-app.subdomain.conf - can reach it over the LAN. Not on the same
       # Docker network/host as SWAG, so no service-name DNS resolution here.
       - 9080:8000
     restart: unless-stopped
